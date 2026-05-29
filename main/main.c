@@ -15,12 +15,13 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include <errno.h>
+#include "ads1298.h"
 
 #define EXAMPLE_ESP_WIFI_SSID      "S50"
 #define EXAMPLE_ESP_WIFI_PASS      "12345678qwe"
 
-#define ADS1298_DEVICE_COUNT        2
-#define ADS1298_FRAME_BYTES         27
+#define ADS1298_DEVICE_COUNT        ADS1298_CHAIN_DEVICES
+#define ADS1298_FRAME_BYTES         ADS1298_DATA_FRAME_SIZE
 #define ADS1298_PACKET_HEADER       0xAA
 #define ADS1298_PACKET_FOOTER       0x55
 #define ADS1298_PACKET_VERSION      0x02
@@ -30,7 +31,7 @@
 #define ADS1298_TCP_PORT            3333
 #define ADS1298_BATCH_FRAMES        50
 #define ADS1298_BATCH_BYTES         (ADS1298_PACKET_SIZE * ADS1298_BATCH_FRAMES)
-#define ADS1298_TARGET_RATE_BPS     500000
+#define ADS1298_DRDY_TIMEOUT_MS     50
 
 static const char *TAG = "ads1298_tcp";
 static uint16_t ads1298_packet_seq = 0;
@@ -40,9 +41,26 @@ static void ads1298_tcp_server_task(void *pvParameters);
 static size_t build_ads1298_packet(uint8_t *packet, size_t capacity);
 static size_t build_ads1298_batch(uint8_t *buffer, size_t capacity, uint16_t frame_count);
 
+/* Read one conversion from hardware (blocks on DRDY) and pack into packet. */
 static size_t build_ads1298_packet(uint8_t *packet, size_t capacity)
 {
     if (capacity < ADS1298_PACKET_SIZE) {
+        return 0;
+    }
+
+    static uint8_t raw[ADS1298_TOTAL_DATA_SIZE];
+
+    for (int _retry = 0; ; _retry++) {
+        if (ads1298_wait_drdy(ADS1298_DRDY_TIMEOUT_MS) == ESP_OK) break;
+        if (_retry >= 2) {
+            ESP_LOGW(TAG, "DRDY timeout (3 retries)");
+            return 0;
+        }
+        ESP_LOGW(TAG, "DRDY timeout, retry %d", _retry + 1);
+    }
+
+    if (ads1298_read_data(raw, sizeof(raw)) != ESP_OK) {
+        ESP_LOGE(TAG, "SPI read failed");
         return 0;
     }
 
@@ -58,21 +76,9 @@ static size_t build_ads1298_packet(uint8_t *packet, size_t capacity)
     packet[7] = (uint8_t)((timestamp_us >> 24) & 0xFF);
     packet[8] = (uint8_t)ADS1298_DEVICE_COUNT;
 
-    for (int dev = 0; dev < ADS1298_DEVICE_COUNT; dev++) {
-        size_t base = 9 + dev * ADS1298_FRAME_BYTES;
-        packet[base + 0] = 0xC0;
-        packet[base + 1] = 0x00;
-        packet[base + 2] = (uint8_t)dev;
-
-        for (int ch = 0; ch < 8; ch++) {
-            int32_t sample = (int32_t)((seq * 37) + (dev * 1000) + (ch * 83));
-            sample = (sample & 0x7FFFFF) - 0x3FFFFF;
-            size_t idx = base + 3 + ch * 3;
-            packet[idx + 0] = (uint8_t)((sample >> 16) & 0xFF);
-            packet[idx + 1] = (uint8_t)((sample >> 8) & 0xFF);
-            packet[idx + 2] = (uint8_t)(sample & 0xFF);
-        }
-    }
+    /* raw[0..26]  = U17 frame (downstream device, exits chain first)
+     * raw[27..53] = U3  frame (upstream device, daisy-chained through U17) */
+    memcpy(packet + 9, raw, ADS1298_PACKET_PAYLOAD_SIZE);
 
     packet[ADS1298_PACKET_SIZE - 1] = ADS1298_PACKET_FOOTER;
     return ADS1298_PACKET_SIZE;
@@ -138,10 +144,7 @@ static void ads1298_tcp_server_task(void *pvParameters)
             continue;
         }
 
-        ESP_LOGI(TAG, "TCP client connected, streaming batched data at %d B/s", ADS1298_TARGET_RATE_BPS);
-
-        int64_t next_send_us = esp_timer_get_time();
-        const int64_t batch_interval_us = ((int64_t)ADS1298_BATCH_BYTES * 1000000LL) / ADS1298_TARGET_RATE_BPS;
+        ESP_LOGI(TAG, "TCP client connected, streaming real ADS1298 data (2000 SPS)");
 
         while (1) {
             size_t batch_len = build_ads1298_batch(ads1298_batch_buf, sizeof(ads1298_batch_buf), ADS1298_BATCH_FRAMES);
@@ -154,15 +157,6 @@ static void ads1298_tcp_server_task(void *pvParameters)
             if (sent < 0) {
                 ESP_LOGW(TAG, "TCP send failed: errno=%d", errno);
                 break;
-            }
-
-            next_send_us += batch_interval_us;
-            int64_t now_us = esp_timer_get_time();
-            if (next_send_us > now_us) {
-                int64_t sleep_us = next_send_us - now_us;
-                vTaskDelay(pdMS_TO_TICKS((sleep_us + 999) / 1000));
-            } else {
-                next_send_us = now_us;
             }
         }
 
@@ -240,6 +234,11 @@ void app_main(void)
             }
         }
     }
+
+    ESP_LOGI(TAG, "Initialising ADS1298...");
+    ESP_ERROR_CHECK(ads1298_init());
+    ESP_ERROR_CHECK(ads1298_start_conversion());
+    ESP_LOGI(TAG, "ADS1298 running at 2000 SPS, starting TCP server");
 
     xTaskCreate(ads1298_tcp_server_task, "ads1298_tcp", 8192, NULL, 4, NULL);
     ESP_LOGI(TAG, "System ready: TCP-only mode");

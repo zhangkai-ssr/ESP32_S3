@@ -1,405 +1,232 @@
-# 手环 ID 数据格式（实时更新）
+# 手环 ID 数据格式（2.4G WiFi 版本）
 
-**来源**: 当前固件 (`src/ble_service.h`, `src/ble_app.c`, `src/emg_acq.c`, `src/mulaw_encode.c`, `src/imu.c`)
-**同步时间**: 2026-05-18
-**状态**: 开发中，协议会演进
+**来源**: 当前固件 (`main/main.c`)，验证工具 (`ads1298_tcp_client.py`)
+**同步时间**: 2026-05-29
+**状态**: 开发中，数据链路验证阶段
 
-> 本文只描述上行数据包（EMG / IMU）的二进制格式。完整 BLE 协议（连接参数、下行命令、电池、状态、OTA 等）见 [`ble-protocol.md`](./ble-protocol.md)。
+> 本文描述基于 **2.4G WiFi / TCP** 链路的上行数据包格式（EMG 通道数据）。当前已接入真实 ADS1298 硬件，采样率 **2000 SPS**。IMU 尚未接入。
 
 ---
 
 ## 1. 总览
 
-**角色**：手环 = BLE Peripheral，App = BLE Central。  
-**通信方向**：上行（设备 → App）走 GATT Notify。
+**角色**：手环 = TCP Server（ESP32-S3-PICO-N8R8），Host/Dongle = TCP Client。  
+**通信方向**：上行（设备 → Host），走 TCP 持续推流。  
+**传输方式**：2.4G WiFi（802.11），TCP，固定端口 `3333`。
 
-### 1.1 Service / Characteristic
+### 1.1 通信参数
 
-| 名称 | 短 UUID | 完整 128-bit UUID | 用途 |
-|---|---|---|---|
-| Notify Service | 0xF100 | `0000F0DE-BC9A-7856-3412-7856341200F1` | 上行数据总服务 |
-| EMG Char       | 0xC101 | `0000F0DE-BC9A-7856-3412-7856341201C1` | EMG 数据 Notify |
-| IMU Char       | 0xC102 | `0000F0DE-BC9A-7856-3412-7856341202C1` | IMU 数据 Notify |
-| RW Char        | 0xC201 | `0000F0DE-BC9A-7856-3412-7856341201C2` | 下行命令 / 查询回包 |
+| 参数 | 值 |
+|---|---|
+| 传输协议 | TCP |
+| 服务端口 | `3333` |
+| 最大客户端数 | 1（单连接） |
+| 包大小 | **64 B**（固定） |
+| 单批发包数 | 50 帧 |
+| 单批字节数 | 3200 B |
+| 目标吞吐率 | ~128000 B/s（2000 SPS × 64 B） |
 
-> 设备名常见为 `nRF54L15_2` / `nRF54L15_T`。连接后 App 订阅 `0xC101` / `0xC102` 的 CCC 即可开始接收数据。连接成功后 ~300 ms 内设备会暂停 Notify（让 MTU 协商 / 配对完成），属正常。
+### 1.2 设备规格约束
 
-### 1.2 共同约定
+| 参数 | 值 |
+|---|---|
+| 主芯片 | ESP32-S3-PICO-N8R8 |
+| 佩戴形态 | 双手佩戴 |
+| EMG 采样率 | 2000 Hz |
+| EMG 通道数 | 16（2 节点 × 8 通道） |
+| EMG 精度 | 24-bit |
+| IMU | 9 轴，LSM9DS1TR（规划中，当前未接入） |
+| 计算/更新频率 | 当前 40 Hz，目标 100–200 Hz |
 
-- **msg_num（包序号）**：每个上行包第 2 字节（offset = 1）。1 字节，0~255 环绕递增。
-  - EMG 与 IMU **各自独立递增**，互不占用。
-  - 同一路流内 msg_num **严格连续**（步长恒为 1，环绕除外），App 可逐包判定丢包：
-
-    ```c
-    gap = (uint8_t)(current_seq - last_seq) - 1;
-    if (gap > 0) lost_count += gap;
-    last_seq = current_seq;
-    ```
-
-- **帧头 / 帧尾**：固定字节，用于包完整性校验，校验失败的包丢弃。
-- **字节序**：
-  - EMG legacy：12-bit MSB-first 紧凑流
-  - EMG μ-law：单字节 int8，无端序问题
-  - IMU：全部 int16 **小端**
-
-### 1.3 EMG 格式选择
-
-EMG 现在支持两种格式，由 App 通过 RW 命令切换：
-
-| fmt | 名称 | 说明 |
-|---|---|---|
-| `0x00` | legacy | 旧版 12-bit packed，20 sample/通道/包，~100 pkt/s |
-| `0x01` | μ-law | 新版 8-bit μ-law，30 sample/通道/包，~67 pkt/s |
-
-**默认行为**：
-- 上电默认 `fmt = 0x00`
-- BLE 断开重连后自动恢复 `fmt = 0x00`
-- App 主动发 `B0 05 01` 后，从**下一个 EMG 包**开始切到 μ-law
-
-**切换 / 查询命令**：
-
-| 命令 | 字节 | 说明 |
-|---|---|---|
-| SET_FMT | `B0 05 <fmt>` | 设置当前 EMG 格式 |
-| QUERY_FMT | `B0 06` | 查询当前格式，设备回 `B0 06 <fmt>` |
-
-### 1.4 速查总表
-
-| | EMG legacy | EMG μ-law | IMU-D1 | IMU-D2 | IMU-D3 |
-|---|---|---|---|---|---|
-| Char UUID | 0xC101 | 0xC101 | 0xC102 | 0xC102 | 0xC102 |
-| 帧头 / 帧尾 | 0xAA / 0x55 | 0xAA / 0x55 | 0xD1 / 0x1D | 0xD2 / 0x2D | 0xD3 / 0x3D |
-| 包大小 | 243 B | 243 B | 35 B | 51 B | 83 B |
-| 通道 / 数据点 | 8 通道 | 8 通道 | 4 个四元数 | 4 个 6 轴 | 4 个 (四元数 + 6 轴) |
-| 每包采样数 | 20 / 通道 | 30 / 通道 | 4 | 4 | 4 |
-| 采样率 | ~1000 Hz | ~1000 Hz | 200 Hz | 200 Hz | 200 Hz |
-| 发包频率 | ~50 Hz | ~33 Hz | 50 Hz | 50 Hz | 50 Hz |
-| 数据编码 | 12-bit 二补码 packed | 8-bit 有符号 μ-law | int16 | int16 | int16 |
-| 字节序 | 12-bit 大端 packed | 单字节 | 小端 | 小端 | 小端 |
-| 估算带宽 | ~95 Kbps | ~64 Kbps | ~14 Kbps | ~20 Kbps | ~33 Kbps |
-
-> 采用 μ-law 的直接动机是：iOS 常见 BLE 链路约束约为 **15 ms × 1 PDU/event ≈ 66 pkt/s**。旧版 2000 Hz 配置下 legacy 100 pkt/s 会持续快于链路排空能力，导致 ACL TX buffer 堵塞、`bt_gatt_notify` 超时、EMG 线程阻塞、DRDY `ovf` 暴涨。当前固件已降到 1000 Hz，legacy 约 50 pkt/s、μ-law 约 33 pkt/s，这个约束已显著放宽，但 μ-law 仍更省空口。
-
----
-
-## 2. EMG 数据包（Char 0xC101）
-
-## 2.1 legacy 格式（fmt = 0x00）
-
-### 基本属性
+### 1.3 速查总表
 
 | 属性 | 值 |
 |---|---|
-| 包长 | **243 B** |
-| 通道数 | 8 |
-| 每包采样数 | 20 / 通道 |
-| 采样率 | ~1000 Hz |
-| 包速率 | ~50 pkt/s |
-| 编码 | 12-bit **有符号补码** |
-| 字节序 | 大端 bitstream（MSB 优先） |
-| 物理单位 | μV，scale = 1 |
-| 数值范围 | −2048 ~ +2047 |
+| 帧头 / 帧尾 | `0xAA` / `0x55` |
+| 包大小 | **64 B** |
+| 版本号 | `0x02` |
+| 序号 | 16-bit，**小端（LE）**，0 起步递增 |
+| 时间戳 | 32-bit 微秒，**小端（LE）** |
+| device_count | `2`（双手 / 双节点） |
+| EMG 通道 | 16 通道（2 设备 × 8 通道） |
+| 编码 | 24-bit 有符号整数（二补码） |
+| 字节序 | seq/timestamp **小端（LE）**；EMG 通道数据**大端（MSB first）** |
 
-### 包结构
+---
+
+## 2. 数据包格式
+
+### 2.1 包总体结构（64 B）
+
+每个 TCP 数据包固定为 **64 字节**，字段顺序如下：
 
 | 字段 | 偏移 | 长度 | 值 / 含义 |
 |---|---|---|---|
-| 帧头 | [0] | 1 B | `0xAA` |
-| msg_num | [1] | 1 B | 包序号 |
-| CH1 | [2..31] | 30 B | 20 样本 × 12-bit packed |
-| CH2 | [32..61] | 30 B | 同上 |
-| CH3 | [62..91] | 30 B | 同上 |
-| CH4 | [92..121] | 30 B | 同上 |
-| CH5 | [122..151] | 30 B | 同上 |
-| CH6 | [152..181] | 30 B | 同上 |
-| CH7 | [182..211] | 30 B | 同上 |
-| CH8 | [212..241] | 30 B | 同上 |
-| 帧尾 | [242] | 1 B | `0x55` |
+| header | [0] | 1 B | `0xAA`，帧头 |
+| version | [1] | 1 B | `0x02`，协议版本 |
+| sequence | [2..3] | 2 B | 16-bit 包序号，**小端（LE）**，0 起步递增 |
+| timestamp_us | [4..7] | 4 B | 32-bit 微秒时间戳（`esp_timer_get_time()`），**小端（LE）** |
+| device_count | [8] | 1 B | `0x02`，当前固定为 2 个设备块 |
+| device_block[0] | [9..35] | 27 B | 设备 0（左手）EMG 数据块 |
+| device_block[1] | [36..62] | 27 B | 设备 1（右手）EMG 数据块 |
+| footer | [63] | 1 B | `0x55`，帧尾 |
 
-### 12-bit Packing 方案
-
-每 2 个 12-bit 样本占 3 字节：
+字节布局示意：
 
 ```text
-S0 = 12 bit, S1 = 12 bit
-Byte[0] = S0[11:4]
-Byte[1] = (S0[3:0] << 4) | S1[11:8]
-Byte[2] = S1[7:0]
+[0]      header       = 0xAA
+[1]      version      = 0x02
+[2..3]   sequence     = uint16, little-endian
+[4..7]   timestamp_us = uint32, little-endian
+[8]      device_count = 0x02
+[9..35]  device_block[0]  (27 B)
+[36..62] device_block[1]  (27 B)
+[63]     footer       = 0x55
 ```
 
 ---
 
-## 2.2 μ-law 格式（fmt = 0x01）
+### 2.2 Device Block 结构（27 B）
 
-### 基本属性
+每个 device block 承载单个设备节点（手）的 8 通道 EMG 数据：
+
+| 字段 | 块内偏移 | 长度 | 值 / 含义 |
+|---|---|---|---|
+| identifier | [+0] | 1 B | `0xC0`，设备块标识 |
+| reserved | [+1] | 1 B | `0x00`，保留 |
+| device_index | [+2] | 1 B | 设备索引：`0` = 左手，`1` = 右手 |
+| ch[0] | [+3..+5] | 3 B | 通道 1，24-bit 有符号整数 |
+| ch[1] | [+6..+8] | 3 B | 通道 2，24-bit 有符号整数 |
+| ch[2] | [+9..+11] | 3 B | 通道 3，24-bit 有符号整数 |
+| ch[3] | [+12..+14] | 3 B | 通道 4，24-bit 有符号整数 |
+| ch[4] | [+15..+17] | 3 B | 通道 5，24-bit 有符号整数 |
+| ch[5] | [+18..+20] | 3 B | 通道 6，24-bit 有符号整数 |
+| ch[6] | [+21..+23] | 3 B | 通道 7，24-bit 有符号整数 |
+| ch[7] | [+24..+26] | 3 B | 通道 8，24-bit 有符号整数 |
+
+> 头部 3 B（identifier + reserved + device_index）+ 8 通道 × 3 B = **27 B / 块**。
+
+---
+
+### 2.3 EMG 数据编码
 
 | 属性 | 值 |
 |---|---|
-| 包长 | **243 B** |
-| 通道数 | 8 |
-| 每包采样数 | 30 / 通道 |
-| 采样率 | ~1000 Hz |
-| 包速率 | ~33 pkt/s |
-| 编码 | 8-bit **有符号 μ-law** |
-| 字节序 | 单字节，无端序问题 |
-| 物理意义 | App 端需先解码回近似 12-bit |
-| 编码值范围 | −127 ~ +127 |
+| 编码 | 24-bit 有符号整数（二补码） |
+| 字节序 | 大端（byte[0] = MSB，byte[2] = LSB） |
+| 每通道每帧样本数 | 1（每帧代表 1 个采样时刻） |
+| 采样率 | 2000 Hz |
 
-### 包结构
-
-| 字段 | 偏移 | 长度 | 值 / 含义 |
-|---|---|---|---|
-| 帧头 | [0] | 1 B | `0xAA` |
-| msg_num | [1] | 1 B | 包序号 |
-| CH1 | [2..31] | 30 B | 30 个 8-bit μ-law 样本 |
-| CH2 | [32..61] | 30 B | 同上 |
-| CH3 | [62..91] | 30 B | 同上 |
-| CH4 | [92..121] | 30 B | 同上 |
-| CH5 | [122..151] | 30 B | 同上 |
-| CH6 | [152..181] | 30 B | 同上 |
-| CH7 | [182..211] | 30 B | 同上 |
-| CH8 | [212..241] | 30 B | 同上 |
-| 帧尾 | [242] | 1 B | `0x55` |
-
-### 通道内顺序
-
-每通道 30 字节，逐样本顺序排列：
+**24-bit 大端打包方式：**
 
 ```text
-ch_byte[0]  = sample[0] 的 μ-law 编码
-ch_byte[1]  = sample[1] 的 μ-law 编码
-...
-ch_byte[29] = sample[29] 的 μ-law 编码
-```
-
-### μ-law 编码公式
-
-把 12-bit signed 输入 `x ∈ [-2048, 2047]` 压缩成 8-bit signed 输出 `y ∈ [-127, 127]`：
-
-```text
-y = sign(x) × log(1 + μ × |x| / V) / log(1 + μ) × 127
-```
-
-参数：
-- `μ = 255`
-- `V = 2047`
-
-然后：
-- round to nearest
-- clip 到 `[-127, +127]`
-
-### 解码公式
-
-```text
-x = sign(y) × ((1 + μ)^(|y|/127) - 1) / μ × V
-```
-
-> 固件端只做编码；解码在 App / 上位机侧完成。
-
-### 固件实现方式
-
-固件不实时算 `log()`，而是查 **4096 项 LUT**：
-
-```c
-encoded = MU_LAW_ENCODE_LUT[x + 2048];
-```
-
-- 输入范围：`x ∈ [-2048, 2047]`
-- LUT 大小：4096 B
-- 超范围输入先 clamp
-
----
-
-## 2.3 解包参考代码（Python）
-
-### legacy 解包
-
-```python
-def unpack_12bit(buf: bytes):
-    out = []
-    for i in range(10):
-        b0, b1, b2 = buf[i*3], buf[i*3+1], buf[i*3+2]
-        s0 = (b0 << 4) | (b1 >> 4)
-        s1 = ((b1 & 0x0F) << 8) | b2
-        if s0 & 0x800: s0 -= 0x1000
-        if s1 & 0x800: s1 -= 0x1000
-        out.append(s0)
-        out.append(s1)
-    return out
-```
-
-### μ-law 解码
-
-```python
-import numpy as np
-
-MU = 255.0
-VMAX = 2047.0
-
-def make_mulaw_decode_lut():
-    y = np.arange(-128, 128, dtype=np.int32)
-    sign = np.sign(y).astype(np.float64)
-    yn = np.clip(np.abs(y) / 127.0, 0.0, 1.0)
-    x = sign * ((1.0 + MU) ** yn - 1.0) / MU * VMAX
-    return np.clip(np.round(x), -2047, 2047).astype(np.int16)
-
-DECODE_LUT = make_mulaw_decode_lut()
-
-def unpack_mulaw(buf: bytes):
-    encoded = np.frombuffer(buf, dtype=np.int8)
-    return DECODE_LUT[encoded.astype(np.int32) + 128]
-```
-
-### 按 fmt 统一解包
-
-```python
-def parse_emg(pkt: bytes, fmt: int):
-    assert len(pkt) == 243
-    assert pkt[0] == 0xAA and pkt[-1] == 0x55
-    seq = pkt[1]
-    channels = []
-    for ch in range(8):
-        off = 2 + ch * 30
-        block = pkt[off:off + 30]
-        if fmt == 0x01:
-            channels.append(unpack_mulaw(block))   # 30 样本
-        else:
-            channels.append(unpack_12bit(block))   # 20 样本
-    return seq, channels
+raw = int24 有符号值
+byte[0] = (raw >> 16) & 0xFF   // MSB
+byte[1] = (raw >>  8) & 0xFF
+byte[2] = (raw >>  0) & 0xFF   // LSB
 ```
 
 ---
 
-## 3. IMU 数据包（Char 0xC102）
+## 3. 序号与时间戳
 
-IMU 有 **D1 / D2 / D3** 三种帧模式，共享相同的特征 UUID，靠**首字节帧头**区分：
-- `0xD1` → 仅四元数
-- `0xD2` → 仅 6 轴原始数据
-- `0xD3` → 四元数 + 6 轴
+### 3.1 序号（sequence）
 
-> **当前默认模式 = D3**。EMG 切到 μ-law **不会影响 IMU 格式**。
+- 16-bit 无符号整数，大端，从 `0` 起步，每帧 +1，`65535` 后环绕回 `0`。
+- Host 端每收一包，将当前 `sequence` 与上一包差值取模 `0xFFFF`，差值不为 1 则判定中间有丢帧，累加差值 − 1 即为丢帧数。
 
-### 3.1 共同属性
+### 3.2 时间戳（timestamp_us）
 
-| 属性 | 值 |
+- 32-bit，单位微秒，大端。
+- 来源：固件调用 `esp_timer_get_time()`，为设备上电后的相对时间，不代表绝对 UTC 时间。
+- Host 端可用于评估发送抖动与帧间隔分布。
+
+---
+
+## 4. 传输策略
+
+| 参数 | 值 |
 |---|---|
-| 采样率 | 200 Hz |
-| 每包采样数 | 4（累积 20 ms） |
-| 包速率 | 50 pkt/s |
-| 字节序 | **小端** (int16 LE) |
-| 包内时间步进 | 5 ms / 样本 |
+| 连接模式 | TCP Server，单 Client |
+| 发送批次 | 每批 50 帧连续发送 |
+| 批次字节数 | 50 × 64 B = 3200 B |
+| 目标吞吐 | ~128000 B/s（2000 SPS × 64 B） |
+| 节奏控制 | `esp_timer_get_time()` + `vTaskDelay()` |
+| 断线重连 | Client 断开后，Server 重新等待下一次连接 |
 
-### 3.2 单个四元数布局（8 B，D1 / D3 用）
-
-| 偏移 | 长度 | 字段 | 编码 |
-|---|---|---|---|
-| +0 | 2 B | qw | int16 LE，`(int16_t)(qw × 32767.0)` |
-| +2 | 2 B | qx | 同上 |
-| +4 | 2 B | qy | 同上 |
-| +6 | 2 B | qz | 同上 |
-
-### 3.3 单个 6 轴布局（12 B，D2 / D3 用）
-
-| 偏移 | 长度 | 字段 | 编码 |
-|---|---|---|---|
-| +0 | 2 B | ax | int16 LE，±4 g 满量程 |
-| +2 | 2 B | ay | 同上 |
-| +4 | 2 B | az | 同上 |
-| +6 | 2 B | gx | int16 LE，±500 dps 满量程 |
-| +8 | 2 B | gy | 同上 |
-| +10 | 2 B | gz | 同上 |
-
-物理量换算：
-- `accel_g  = raw / 32768 × 4`
-- `gyro_dps = raw / 32768 × 500`
-
-> 设备端已做 **轴交换 X↔Y**（修正横滚 / 仰俯，见 `src/imu.c`），App 端拿到的是已交换的数据，不需要再处理。
-
-### 3.4 D1 包结构（仅四元数，35 B）
-
-| 偏移 | 长度 | 内容 |
-|---|---|---|
-| [0]      | 1 B | 帧头 `0xD1` |
-| [1]      | 1 B | msg_num |
-| [2..9]   | 8 B | 四元数 #1（t + 0 ms） |
-| [10..17] | 8 B | 四元数 #2（t + 5 ms） |
-| [18..25] | 8 B | 四元数 #3（t + 10 ms） |
-| [26..33] | 8 B | 四元数 #4（t + 15 ms） |
-| [34]     | 1 B | 帧尾 `0x1D` |
-
-### 3.5 D2 包结构（仅 6 轴，51 B）
-
-| 偏移 | 长度 | 内容 |
-|---|---|---|
-| [0]      | 1 B  | 帧头 `0xD2` |
-| [1]      | 1 B  | msg_num |
-| [2..13]  | 12 B | 6 轴 #1（t + 0 ms） |
-| [14..25] | 12 B | 6 轴 #2（t + 5 ms） |
-| [26..37] | 12 B | 6 轴 #3（t + 10 ms） |
-| [38..49] | 12 B | 6 轴 #4（t + 15 ms） |
-| [50]     | 1 B  | 帧尾 `0x2D` |
-
-### 3.6 D3 包结构（四元数 + 6 轴，83 B）
-
-| 偏移 | 长度 | 内容 |
-|---|---|---|
-| [0]      | 1 B  | 帧头 `0xD3` |
-| [1]      | 1 B  | msg_num |
-| [2..21]  | 20 B | 数据点 #1（t + 0 ms）= 四元数 8B + 6 轴 12B |
-| [22..41] | 20 B | 数据点 #2（t + 5 ms） |
-| [42..61] | 20 B | 数据点 #3（t + 10 ms） |
-| [62..81] | 20 B | 数据点 #4（t + 15 ms） |
-| [82]     | 1 B  | 帧尾 `0x3D` |
-
-每个 20 B 数据点内部：
-
-| 偏移 | 长度 | 内容 |
-|---|---|---|
-| +0..+7   | 8 B  | 四元数（qw, qx, qy, qz，各 int16 LE） |
-| +8..+19  | 12 B | 6 轴（ax, ay, az, gx, gy, gz，各 int16 LE） |
-
-### 3.7 解包参考代码（Python，D3）
-
-```python
-import struct
-
-IMU_D3_HEADER = 0xD3
-IMU_D3_FOOTER = 0x3D
-IMU_D3_PKT_SIZE = 83
-ACC_FS_G = 4.0
-GYRO_FS_DPS = 500.0
-
-def parse_imu_d3(pkt: bytes):
-    assert len(pkt) == IMU_D3_PKT_SIZE
-    assert pkt[0] == IMU_D3_HEADER and pkt[-1] == IMU_D3_FOOTER
-    seq = pkt[1]
-    points = []
-    for i in range(4):
-        off = 2 + i * 20
-        qw, qx, qy, qz = struct.unpack_from("<hhhh", pkt, off)
-        ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", pkt, off + 8)
-        points.append({
-            "quat":  (qw / 32767.0, qx / 32767.0, qy / 32767.0, qz / 32767.0),
-            "accel_g":  (ax / 32768.0 * ACC_FS_G,
-                         ay / 32768.0 * ACC_FS_G,
-                         az / 32768.0 * ACC_FS_G),
-            "gyro_dps": (gx / 32768.0 * GYRO_FS_DPS,
-                         gy / 32768.0 * GYRO_FS_DPS,
-                         gz / 32768.0 * GYRO_FS_DPS),
-        })
-    return seq, points
-```
+> 当前只支持**单客户端连接**，不支持多连接广播。
 
 ---
 
-## 4. 时间轴与丢包
+## 5. IMU 数据格式（LSM9DS1TR，规划中）
 
-- 每路流的时间轴**独立**展开：
-  - EMG legacy：包周期 ≈20 ms，包内样本步进 1 ms
-  - EMG μ-law：包周期 ≈30 ms，包内样本步进 1 ms
-  - IMU：包周期 20 ms，包内样本步进 5 ms
-- App 端把首包到达时刻记作 `t0`，后续样本时间 = `t0 + 累计样本数 × 步进`。
-- EMG / IMU 的 `msg_num` **独立递增**，本身不反映跨流时间关系，请各自维护时间轴。
-- 设备端**不做应用层重传**；BLE 链路层有 PDU 重传保证基础可靠性。BLE 断开期间设备**不缓存**数据。
+当前固件**尚未实现** IMU 数据采集与传输；以下为规划格式，待驱动接入后最终确认。
 
-更详细的连接参数、丢包处理、电池上报、下行命令格式见 [`ble-protocol.md`](./ble-protocol.md)。
+### 5.1 芯片规格
+
+| 参数 | 值 |
+|---|---|
+| 芯片型号 | LSM9DS1TR（ST Microelectronics） |
+| 轴组成 | 3 轴加速度计 + 3 轴陀螺仪 + 3 轴磁力计 = **9 轴** |
+| 加速度计量程 | ±2 / ±4 / ±8 / ±16 g（可配置） |
+| 陀螺仪量程 | ±245 / ±500 / ±2000 dps（可配置） |
+| 磁力计量程 | ±4 / ±8 / ±12 / ±16 gauss（可配置） |
+| 原始分辨率 | 16-bit 有符号整数（各轴） |
+| 字节序 | 小端（int16 LE） |
+
+### 5.2 单样本数据布局（20 B）
+
+| 字段 | 偏移 | 长度 | 编码 | 物理换算 |
+|---|---|---|---|---|
+| ax | [+0..+1] | 2 B | int16 LE | `raw / 32768 × FS_g`（g） |
+| ay | [+2..+3] | 2 B | int16 LE | 同上 |
+| az | [+4..+5] | 2 B | int16 LE | 同上 |
+| gx | [+6..+7] | 2 B | int16 LE | `raw / 32768 × FS_dps`（dps） |
+| gy | [+8..+9] | 2 B | int16 LE | 同上 |
+| gz | [+10..+11] | 2 B | int16 LE | 同上 |
+| mx | [+12..+13] | 2 B | int16 LE | `raw / 32768 × FS_gauss`（gauss） |
+| my | [+14..+15] | 2 B | int16 LE | 同上 |
+| mz | [+16..+17] | 2 B | int16 LE | 同上 |
+| reserved | [+18..+19] | 2 B | — | 字节对齐保留 |
+
+> `FS_g / FS_dps / FS_gauss` 由固件配置项决定，默认规划值：±4 g / ±500 dps / ±8 gauss。
+
+### 5.3 规划传输方式
+
+| 参数 | 规划值 |
+|---|---|
+| 传输方式 | 复用同一 TCP 流，新增 IMU 帧类型 |
+| 帧头标识 | 待定（与 EMG 帧 `0xAA` 区分） |
+| 每包样本数 | 待定 |
+| 采样率 | 待定 |
+
+---
+
+## 6. 时间轴与丢帧处理
+
+- Host 端以**收到首包时刻**为 `t0`，后续帧时间按 `timestamp_us` 字段或 `sequence` 推算。
+- 每帧承载 1 个采样点，帧间隔 = `1 / 2000 Hz = 0.5 ms`。
+- 检测丢帧：用 `sequence` 字段连续性判断（见 §3.1）。
+- **固件不做应用层重传**；TCP 链路层保证传输可靠性，连接断开期间数据丢失。
+
+---
+
+## 7. 附录：Host 验证工具
+
+当前仓库自带主机侧验证脚本：
+
+```bash
+# 基础连接（默认端口 3333）
+python ads1298_tcp_client.py <ESP32_IP>
+
+# 指定端口
+python ads1298_tcp_client.py <ESP32_IP> 3333
+```
+
+脚本验证项：
+- 包头 / 包尾是否为 `0xAA` / `0x55`
+- 包长是否恒定为 **64 B**
+- `sequence` 是否严格连续（检测丢帧）
+- 吞吐率是否稳定
+
+> 如果修改了包格式，必须**同步修改** `ads1298_tcp_client.py`，否则 host 与固件立刻失配。
