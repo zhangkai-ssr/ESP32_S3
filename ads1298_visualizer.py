@@ -141,7 +141,7 @@ class EMGVisualizer:
         lbl('ESP32 IP:').pack(side='left', padx=(8, 2))
         self.e_ip = tk.Entry(bar, width=15, bg=BG_FIELD, fg=FG_MAIN,
                              insertbackground=FG_MAIN, relief='flat')
-        self.e_ip.insert(0, '192.168.1.100')
+        self.e_ip.insert(0, '10.245.73.42')
         self.e_ip.pack(side='left', padx=2)
 
         lbl('Port:').pack(side='left', padx=(6, 2))

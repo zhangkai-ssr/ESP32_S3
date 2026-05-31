@@ -62,7 +62,7 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
-    sock.settimeout(2.0)
+    sock.settimeout(5.0)
 
     print(f"Connected to {host}:{port}")
     print(
@@ -83,9 +83,19 @@ def main():
     last_dev_ts = None
     last_host_ts = None
 
+    consecutive_timeouts = 0
     try:
         while True:
-            chunk = sock.recv(8192)
+            try:
+                chunk = sock.recv(8192)
+            except TimeoutError:
+                consecutive_timeouts += 1
+                print(f"recv timeout #{consecutive_timeouts}: no data from ESP32 (ADS1298 streaming?)")
+                if consecutive_timeouts >= 3:
+                    print("3 consecutive timeouts — giving up")
+                    break
+                continue
+            consecutive_timeouts = 0
             if not chunk:
                 print("Server closed connection")
                 break
