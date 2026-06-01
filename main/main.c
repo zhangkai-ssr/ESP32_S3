@@ -8,6 +8,8 @@
 #include "ads1298_stream.h"
 #include "lsm9ds1.h"
 #include "imu_stream.h"
+#include "time_sync.h"
+#include "pmic_npm1300.h"
 
 static const char *TAG = "main";
 
@@ -39,9 +41,30 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
     log_memory_snapshot("nvs_ready");
 
+    esp_err_t pmic_ret = pmic_npm1300_init();
+    if (pmic_ret != ESP_OK) {
+        ESP_LOGW(TAG, "PMIC init failed (%s) – continuing without PMIC", esp_err_to_name(pmic_ret));
+    }
+    log_memory_snapshot("pmic_ready");
+
     wifi_manager_init();
     wifi_manager_wait_connected();
     log_memory_snapshot("wifi_connected");
+
+    time_sync_start();
+    /* Wait for time sync lock, or fall through after 5 s to start streams anyway */
+    for (int i = 0; i < 50; i++) {
+        if (time_sync_is_locked()) {
+            ESP_LOGI(TAG, "time sync locked (offset=%lld µs)",
+                     (long long)time_sync_offset_us());
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!time_sync_is_locked()) {
+        ESP_LOGW(TAG, "time sync not locked after 5 s — proceeding with raw MCU time");
+    }
+    log_memory_snapshot("time_sync_ready");
 
     ESP_LOGI(TAG, "Initialising ADS1298...");
     ESP_ERROR_CHECK(ads1298_init());
