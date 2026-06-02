@@ -1,15 +1,29 @@
 import socket
+import struct
 import sys
 import time
 
 HEADER = 0xAA
-VERSION = 0x02
 FOOTER = 0x55
 DEVICE_COUNT = 2
-PACKET_SIZE = 64
 DEFAULT_PORT = 3333
 REPORT_INTERVAL = 1.0
-TIMESTAMP_WRAP_US = 1 << 32
+
+# Protocol versions
+# v0x02: 64-byte packet, 32-bit timestamp at [4..7], device_count at [8]
+# v0x03: 68-byte packet, 64-bit mcu_ts_us at [4..11], device_count at [12]
+V2_VERSION   = 0x02
+V2_SIZE      = 64
+V2_DC_OFFSET = 8
+
+V3_VERSION   = 0x03
+V3_SIZE      = 68
+V3_DC_OFFSET = 12
+
+# Active version detected from first valid packet
+_version    = V3_VERSION
+_pkt_size   = V3_SIZE
+_dc_offset  = V3_DC_OFFSET
 
 
 def u16_le(data: bytes, offset: int) -> int:
@@ -25,12 +39,38 @@ def u32_le(data: bytes, offset: int) -> int:
     )
 
 
+def u64_le(data: bytes, offset: int) -> int:
+    return struct.unpack_from('<Q', data, offset)[0]
+
+
+def detect_version(candidate: bytes) -> bool:
+    """Try to detect protocol version from first candidate. Returns True if recognised."""
+    global _version, _pkt_size, _dc_offset
+    for ver, sz, dc in (
+        (V3_VERSION, V3_SIZE, V3_DC_OFFSET),
+        (V2_VERSION, V2_SIZE, V2_DC_OFFSET),
+    ):
+        if (
+            len(candidate) >= sz
+            and candidate[0] == HEADER
+            and candidate[1] == ver
+            and candidate[sz - 1] == FOOTER
+            and candidate[dc] == DEVICE_COUNT
+        ):
+            _version   = ver
+            _pkt_size  = sz
+            _dc_offset = dc
+            print(f"Detected protocol v0x{ver:02X}: {sz}-byte packets")
+            return True
+    return False
+
+
 def looks_like_packet(candidate: bytes) -> bool:
     return (
-        len(candidate) == PACKET_SIZE
+        len(candidate) == _pkt_size
         and candidate[0] == HEADER
-        and candidate[1] == VERSION
-        and candidate[8] == DEVICE_COUNT
+        and candidate[1] == _version
+        and candidate[_dc_offset] == DEVICE_COUNT
         and candidate[-1] == FOOTER
     )
 
@@ -38,16 +78,16 @@ def looks_like_packet(candidate: bytes) -> bool:
 def extract_packets(buffer: bytearray):
     packets = []
     skipped = 0
-    while len(buffer) >= PACKET_SIZE:
-        if looks_like_packet(buffer[:PACKET_SIZE]):
-            packets.append(bytes(buffer[:PACKET_SIZE]))
-            del buffer[:PACKET_SIZE]
+    while len(buffer) >= _pkt_size:
+        if looks_like_packet(buffer[:_pkt_size]):
+            packets.append(bytes(buffer[:_pkt_size]))
+            del buffer[:_pkt_size]
             continue
 
         header_pos = buffer.find(bytes([HEADER]), 1)
         if header_pos == -1:
-            skipped += len(buffer) - (PACKET_SIZE - 1)
-            del buffer[: len(buffer) - (PACKET_SIZE - 1)]
+            skipped += len(buffer) - (_pkt_size - 1)
+            del buffer[: len(buffer) - (_pkt_size - 1)]
             break
 
         skipped += header_pos
@@ -65,10 +105,7 @@ def main():
     sock.settimeout(5.0)
 
     print(f"Connected to {host}:{port}")
-    print(
-        f"Expecting {PACKET_SIZE}B packets, "
-        f"header=0x{HEADER:02X}, version=0x{VERSION:02X}, footer=0x{FOOTER:02X}"
-    )
+    print(f"Auto-detecting protocol version (v0x02=64B or v0x03=68B)...")
 
     recv_buffer = bytearray()
     total_bytes = 0
@@ -105,6 +142,10 @@ def main():
             total_bytes += len(chunk)
             report_bytes += len(chunk)
 
+            # Version auto-detect on first usable chunk
+            if total_packets == 0 and len(recv_buffer) >= V3_SIZE:
+                detect_version(recv_buffer[:max(V3_SIZE, V2_SIZE)])
+
             packets, skipped = extract_packets(recv_buffer)
             bad_bytes += skipped
 
@@ -117,9 +158,15 @@ def main():
                     print(f"Sequence jump: prev={last_seq} now={seq}")
                 last_seq = seq
 
-                dev_ts_us = u32_le(packet, 4)
+                if _version == V3_VERSION:
+                    dev_ts_us = u64_le(packet, 4)
+                    ts_wrap = 1 << 64
+                else:
+                    dev_ts_us = u32_le(packet, 4)
+                    ts_wrap = 1 << 32
+
                 if last_dev_ts is not None and last_host_ts is not None:
-                    dev_delta_us = (dev_ts_us - last_dev_ts) & 0xFFFFFFFF
+                    dev_delta_us = (dev_ts_us - last_dev_ts) % ts_wrap
                     host_delta_us = recv_time_us - last_host_ts
                     gap_ms = (host_delta_us - dev_delta_us) / 1000.0
                     if gap_ms < 0:

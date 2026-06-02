@@ -1,0 +1,5 @@
+# Time sync server IP — 修改为当前局域网内运行 time_sync_server.py 的主机 IP
+CONFIG_TIME_SYNC_SERVER_IP="10.245.73.12"
+
+# Device node ID: 1=左手, 2=右手
+CONFIG_DEVICE_ID=1

@@ -7,14 +7,14 @@
  *   tcp_server_task   – Waits for a client, drains the queue in batches of
  *                       IMU_BATCH_SAMPLES and sends one TCP packet per batch.
  *
- * TCP Packet format (211 bytes for IMU_BATCH_SAMPLES = 10):
+ * TCP Packet format v0x02 (215 bytes for IMU_BATCH_SAMPLES = 10):
  *   [0]       0xBB          header  (IMU frame, distinct from EMG 0xAA)
- *   [1]       0x01          version
+ *   [1]       0x02          version
  *   [2]       0x20          type  (IMU)
  *   [3..4]    uint16_t LE   sequence number
- *   [5..8]    uint32_t LE   timestamp of first sample (µs, esp_timer_get_time)
- *   [9]       uint8_t       n_samples (= IMU_BATCH_SAMPLES)
- *   [10..]    n × 20 bytes  per-sample layout (doc §5.2):
+ *   [5..12]   int64_t LE    64-bit MCU timestamp of first sample (µs, esp_timer_get_time)
+ *   [13]      uint8_t       n_samples (= IMU_BATCH_SAMPLES)
+ *   [14..]    n × 20 bytes  per-sample layout (doc §5.2):
  *                             ax ay az gx gy gz mx my mz rsvd  (int16_t LE each)
  *   [last]    0x55          footer
  *
@@ -37,6 +37,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "time_sync.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
@@ -49,11 +50,11 @@ static const char *TAG = "imu_stream";
 
 #define PACKET_HEADER       0xBB
 #define PACKET_FOOTER       0x55
-#define PACKET_VERSION      0x01
+#define PACKET_VERSION      0x02
 #define PACKET_TYPE_IMU     0x20
 
 #define SAMPLE_BYTES        20        /* ax ay az gx gy gz mx my mz rsvd  × int16_t (doc §5.2) */
-#define PACKET_OVERHEAD     (1+1+1+2+4+1+1)  /* hdr+ver+type+seq+ts+n+ftr */
+#define PACKET_OVERHEAD     (1+1+1+2+8+1+1)  /* hdr+ver+type+seq+ts64+n+ftr */
 #define PACKET_SIZE         (PACKET_OVERHEAD + IMU_BATCH_SAMPLES * SAMPLE_BYTES)
 
 /* ---- Internal types ---- */
@@ -61,7 +62,7 @@ typedef struct {
     int16_t  ax, ay, az;
     int16_t  gx, gy, gz;
     int16_t  mx, my, mz;
-    uint32_t ts_us;
+    int64_t  ts_us;
 } imu_sample_t;
 
 /* ---- Module state ---- */
@@ -130,7 +131,7 @@ static void imu_sample_task(void *pv)
             .ax    = raw.ax, .ay = raw.ay, .az = raw.az,
             .gx    = raw.gx, .gy = raw.gy, .gz = raw.gz,
             .mx    = raw.mx, .my = raw.my, .mz = raw.mz,
-            .ts_us = (uint32_t)esp_timer_get_time(),
+            .ts_us = time_sync_now_us(),  /* host-aligned if locked, raw MCU otherwise */
         };
 
         if (!s_client_active) {
@@ -158,7 +159,7 @@ static size_t build_packet(uint8_t *buf)
     }
 
     uint16_t seq = s_seq++;
-    uint32_t ts  = samples[0].ts_us;
+    uint64_t ts  = (uint64_t)samples[0].ts_us;
     size_t   off = 0;
 
     buf[off++] = PACKET_HEADER;
@@ -166,10 +167,15 @@ static size_t build_packet(uint8_t *buf)
     buf[off++] = PACKET_TYPE_IMU;
     buf[off++] = (uint8_t)(seq & 0xFF);
     buf[off++] = (uint8_t)(seq >> 8);
+    /* 64-bit MCU timestamp of first sample, little-endian [5..12] */
     buf[off++] = (uint8_t)(ts & 0xFF);
     buf[off++] = (uint8_t)((ts >>  8) & 0xFF);
     buf[off++] = (uint8_t)((ts >> 16) & 0xFF);
     buf[off++] = (uint8_t)((ts >> 24) & 0xFF);
+    buf[off++] = (uint8_t)((ts >> 32) & 0xFF);
+    buf[off++] = (uint8_t)((ts >> 40) & 0xFF);
+    buf[off++] = (uint8_t)((ts >> 48) & 0xFF);
+    buf[off++] = (uint8_t)((ts >> 56) & 0xFF);
     buf[off++] = (uint8_t)IMU_BATCH_SAMPLES;
 
     for (int i = 0; i < IMU_BATCH_SAMPLES; i++) {

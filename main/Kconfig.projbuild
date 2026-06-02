@@ -1,0 +1,28 @@
+menu "Neural Wristband Configuration"
+
+    config DEVICE_ID
+        int "Device node ID (1=left hand, 2=right hand)"
+        default 1
+        range 1 2
+        help
+            Identifies which wristband this firmware runs on.
+            1 = left hand, 2 = right hand.
+            Used in UDP time-sync request packets and EMG/IMU data headers.
+
+    config TIME_SYNC_SERVER_IP
+        string "Time sync server IP address"
+        default "192.168.4.1"
+        help
+            IP address of the AP host running time_sync_server.py on UDP port 3332.
+            Defaults to the standard SoftAP gateway address.
+
+    config TIME_SYNC_PERIOD_MS
+        int "Periodic re-sync interval (ms)"
+        default 2000
+        range 500 30000
+        help
+            How often (ms) the firmware re-synchronises with the time sync server
+            during normal operation. Offset is updated via a low-pass filter so
+            data timestamps cannot jump suddenly.
+
+endmenu

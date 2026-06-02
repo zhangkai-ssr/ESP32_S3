@@ -11,11 +11,12 @@
 #include "lwip/netdb.h"
 #include "ads1298.h"
 #include "emg_filter.h"
+#include "time_sync.h"
 
 #define PACKET_HEADER       0xAA
 #define PACKET_FOOTER       0x55
-#define PACKET_VERSION      0x02
-#define TIMESTAMP_BYTES     4
+#define PACKET_VERSION      0x03
+#define TIMESTAMP_BYTES     8
 #define PAYLOAD_SIZE        (ADS1298_CHAIN_DEVICES * ADS1298_DATA_FRAME_SIZE)
 #define PACKET_SIZE         (1 + 1 + 2 + TIMESTAMP_BYTES + 1 + PAYLOAD_SIZE + 1)
 #define TCP_PORT            3333
@@ -80,20 +81,25 @@ static size_t build_packet(uint8_t *packet, size_t capacity)
     }
 
     uint16_t seq = s_seq++;
-    uint32_t ts  = (uint32_t)esp_timer_get_time();
+    uint64_t ts  = (uint64_t)time_sync_now_us();  /* host-aligned if locked, raw MCU otherwise */
 
     packet[0] = PACKET_HEADER;
     packet[1] = PACKET_VERSION;
     packet[2] = (uint8_t)(seq & 0xFF);
     packet[3] = (uint8_t)((seq >> 8) & 0xFF);
-    packet[4] = (uint8_t)(ts & 0xFF);
-    packet[5] = (uint8_t)((ts >> 8) & 0xFF);
-    packet[6] = (uint8_t)((ts >> 16) & 0xFF);
-    packet[7] = (uint8_t)((ts >> 24) & 0xFF);
-    packet[8] = (uint8_t)ADS1298_CHAIN_DEVICES;
+    /* 64-bit MCU timestamp, little-endian [4..11] */
+    packet[4]  = (uint8_t)(ts & 0xFF);
+    packet[5]  = (uint8_t)((ts >>  8) & 0xFF);
+    packet[6]  = (uint8_t)((ts >> 16) & 0xFF);
+    packet[7]  = (uint8_t)((ts >> 24) & 0xFF);
+    packet[8]  = (uint8_t)((ts >> 32) & 0xFF);
+    packet[9]  = (uint8_t)((ts >> 40) & 0xFF);
+    packet[10] = (uint8_t)((ts >> 48) & 0xFF);
+    packet[11] = (uint8_t)((ts >> 56) & 0xFF);
+    packet[12] = (uint8_t)ADS1298_CHAIN_DEVICES;
 
     /* raw[0..26]  = U17 frame; raw[27..53] = U3 frame */
-    memcpy(packet + 9, raw, PAYLOAD_SIZE);
+    memcpy(packet + 13, raw, PAYLOAD_SIZE);
 
     packet[PACKET_SIZE - 1] = PACKET_FOOTER;
     return PACKET_SIZE;
