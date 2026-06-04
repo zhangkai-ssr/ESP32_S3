@@ -23,6 +23,7 @@
 #define BATCH_FRAMES        50
 #define BATCH_BYTES         (PACKET_SIZE * BATCH_FRAMES)
 #define DRDY_TIMEOUT_MS     50
+#define DRDY_RECOVER_ATTEMPTS 3
 
 static const char *TAG = "ads1298_stream";
 
@@ -59,6 +60,8 @@ static size_t build_packet(uint8_t *packet, size_t capacity)
         }
         ESP_LOGW(TAG, "DRDY timeout, retry %d", retry + 1);
     }
+    /* Timestamp at DRDY assertion = ADC conversion complete, before SPI transfer latency */
+    int64_t sample_ts = time_sync_now_us();
 
     if (ads1298_read_data(raw, sizeof(raw)) != ESP_OK) {
         ESP_LOGE(TAG, "SPI read failed");
@@ -81,7 +84,7 @@ static size_t build_packet(uint8_t *packet, size_t capacity)
     }
 
     uint16_t seq = s_seq++;
-    uint64_t ts  = (uint64_t)time_sync_now_us();  /* host-aligned if locked, raw MCU otherwise */
+    uint64_t ts  = (uint64_t)sample_ts;
 
     packet[0] = PACKET_HEADER;
     packet[1] = PACKET_VERSION;
@@ -171,8 +174,27 @@ static void tcp_server_task(void *pvParameters)
         while (1) {
             size_t len = build_batch(s_batch_buf, sizeof(s_batch_buf), BATCH_FRAMES);
             if (len == 0) {
-                ESP_LOGE(TAG, "batch build failed");
-                break;
+                /* Attempt to recover ADS1298 (e.g. exited RDATAC due to SPI noise) */
+                bool recovered = false;
+                for (int ra = 0; ra < DRDY_RECOVER_ATTEMPTS; ra++) {
+                    ESP_LOGW(TAG, "ADS1298 recovery attempt %d/%d", ra + 1, DRDY_RECOVER_ATTEMPTS);
+                    if (ads1298_start_conversion() == ESP_OK) {
+                        emg_filter_bank_init(&s_filter_bank); /* reset filter state after gap */
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                        uint8_t probe[PACKET_SIZE];
+                        if (build_packet(probe, sizeof(probe)) > 0) {
+                            ESP_LOGI(TAG, "ADS1298 recovered after %d attempt(s)", ra + 1);
+                            recovered = true;
+                            break;
+                        }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!recovered) {
+                    ESP_LOGE(TAG, "ADS1298 unrecoverable — dropping client");
+                    break;
+                }
+                continue;
             }
             if (send(client_sock, (const char *)s_batch_buf, (int)len, 0) < 0) {
                 ESP_LOGW(TAG, "send failed: errno=%d", errno);

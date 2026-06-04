@@ -26,6 +26,7 @@
  */
 
 #include "time_sync.h"
+#include "wifi_manager.h"
 
 #include <string.h>
 #include <errno.h>
@@ -103,10 +104,12 @@ static inline uint16_t read_le16(const uint8_t *p)
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 
-/* ---- Perform one sync round; returns true on success ---- */
+/* ---- Perform one sync round; returns true on success, false on failure.
+ *      Sets *enomem_out=true if sendto failed due to ARP queue overflow. ---- */
 static bool do_sync_round(int sock, struct sockaddr_in *srv,
                           uint16_t seq,
-                          int64_t *out_rtt_us, int64_t *out_offset_us)
+                          int64_t *out_rtt_us, int64_t *out_offset_us,
+                          bool *enomem_out)
 {
     uint8_t req[REQ_SIZE];
     req[0] = MAGIC_0;
@@ -122,8 +125,14 @@ static bool do_sync_round(int sock, struct sockaddr_in *srv,
     int64_t t1 = esp_timer_get_time();
     write_le64(req + 10, t1);
 
+    if (enomem_out) *enomem_out = false;
     if (sendto(sock, req, REQ_SIZE, 0, (struct sockaddr *)srv, sizeof(*srv)) < 0) {
-        ESP_LOGW(TAG, "sendto failed: errno=%d", errno);
+        if (errno == ENOMEM) {
+            ESP_LOGW(TAG, "sendto ENOMEM (ARP queue full) — server unreachable or offline");
+            if (enomem_out) *enomem_out = true;
+        } else {
+            ESP_LOGW(TAG, "sendto failed: errno=%d", errno);
+        }
         return false;
     }
 
@@ -209,7 +218,8 @@ static void time_sync_task(void *pv)
 
     for (int i = 0; i < INIT_ROUNDS; i++) {
         int64_t rtt, offset;
-        if (do_sync_round(sock, &srv, seq++, &rtt, &offset)) {
+        bool    enomem = false;
+        if (do_sync_round(sock, &srv, seq++, &rtt, &offset, &enomem)) {
             success++;
             if (rtt < best_rtt) {
                 best_rtt    = rtt;
@@ -217,10 +227,15 @@ static void time_sync_task(void *pv)
             }
             ESP_LOGI(TAG, "init[%2d/%d] rtt=%7lld µs  offset=%+lld µs",
                      i + 1, INIT_ROUNDS, (long long)rtt, (long long)offset);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        } else if (enomem) {
+            /* ARP queue full – server IP unreachable; back off to let lwIP drain */
+            ESP_LOGW(TAG, "init[%2d/%d] ARP queue full – backoff 1 s", i + 1, INIT_ROUNDS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
             ESP_LOGW(TAG, "init[%2d/%d] no response", i + 1, INIT_ROUNDS);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     if (success > 0) {
@@ -239,8 +254,13 @@ static void time_sync_task(void *pv)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_TIME_SYNC_PERIOD_MS));
 
+        if (!wifi_manager_is_connected()) {
+            ESP_LOGD(TAG, "periodic sync: WiFi not connected, skipping");
+            continue;
+        }
+
         int64_t rtt, offset;
-        if (do_sync_round(sock, &srv, seq++, &rtt, &offset)) {
+        if (do_sync_round(sock, &srv, seq++, &rtt, &offset, NULL)) {
             taskENTER_CRITICAL(&s_mux);
             int64_t old = s_offset_us;
             /* new = old*(1-α) + new*α  (integer arithmetic) */

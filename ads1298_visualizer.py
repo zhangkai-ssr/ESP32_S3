@@ -14,10 +14,11 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ---------- Packet constants ----------
 HEADER = 0xAA
-VERSION = 0x02
+VERSION = 0x03
 FOOTER = 0x55
 DEVICE_COUNT = 2
-PACKET_SIZE = 64
+PACKET_SIZE = 68
+DEVICE_COUNT_OFFSET = 12
 DEFAULT_PORT = 3333
 SAMPLE_RATE = 2000      # Hz
 VREF = 4.5              # V
@@ -41,7 +42,7 @@ def adc_to_uv(raw):
 
 def looks_like_packet(buf):
     return (len(buf) == PACKET_SIZE and buf[0] == HEADER and
-            buf[1] == VERSION and buf[8] == DEVICE_COUNT and buf[-1] == FOOTER)
+            buf[1] == VERSION and buf[DEVICE_COUNT_OFFSET] == DEVICE_COUNT and buf[-1] == FOOTER)
 
 
 def extract_packets(buffer):
@@ -65,7 +66,7 @@ def extract_packets(buffer):
 def parse_channels(pkt):
     """Return 16 channel values in µV."""
     vals = []
-    payload = pkt[9:63]             # 54 bytes: [U17 27B][U3 27B]
+    payload = pkt[13:67]            # 54 bytes: [U17 27B][U3 27B]
     for dev in range(2):
         frame = payload[dev * 27:(dev + 1) * 27]
         for ch in range(8):         # frame[0:3]=status, frame[3:27]=data

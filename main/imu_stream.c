@@ -90,10 +90,12 @@ static void log_imu_memory(const char *stage)
              (unsigned)sizeof(s_packet));
 }
 
-/* ---- 200 Hz timer callback (task context, ESP_TIMER_TASK) ---- */
-static void imu_timer_cb(void *arg)
+/* ---- 200 Hz timer callback (ISR context, ESP_TIMER_ISR) ---- */
+static void IRAM_ATTR imu_timer_cb(void *arg)
 {
-    xSemaphoreGive(s_timer_sem);
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_timer_sem, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
 /* ---- Sampling task: blocks on semaphore, reads IMU, enqueues ---- */
@@ -104,7 +106,7 @@ static void imu_sample_task(void *pv)
     const esp_timer_create_args_t timer_args = {
         .callback        = imu_timer_cb,
         .arg             = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
+        .dispatch_method = ESP_TIMER_ISR,
         .name            = "imu_200hz",
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
@@ -116,6 +118,8 @@ static void imu_sample_task(void *pv)
             ESP_LOGW(TAG, "timer sem timeout");
             continue;
         }
+        /* Timestamp at timer fire = intended 200 Hz sample time, before I2C read latency */
+        int64_t sample_ts = time_sync_now_us();
 
         lsm9ds1_data_t raw;
         if (lsm9ds1_read(&raw) != ESP_OK) {
@@ -131,7 +135,7 @@ static void imu_sample_task(void *pv)
             .ax    = raw.ax, .ay = raw.ay, .az = raw.az,
             .gx    = raw.gx, .gy = raw.gy, .gz = raw.gz,
             .mx    = raw.mx, .my = raw.my, .mz = raw.mz,
-            .ts_us = time_sync_now_us(),  /* host-aligned if locked, raw MCU otherwise */
+            .ts_us = sample_ts,
         };
 
         if (!s_client_active) {

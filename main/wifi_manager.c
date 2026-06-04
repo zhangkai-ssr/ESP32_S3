@@ -22,6 +22,8 @@
 
 static const char *TAG = "wifi_manager";
 
+static volatile bool s_connected = false;
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -30,10 +32,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Connecting WiFi...");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+        s_connected = false;
         esp_wifi_connect();
         ESP_LOGI(TAG, "WiFi disconnected, reason=%d, retrying...", disconn->reason);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_connected = true;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
@@ -71,6 +75,11 @@ void wifi_manager_init(void)
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
     esp_wifi_set_ps(WIFI_PS_NONE);
+}
+
+bool wifi_manager_is_connected(void)
+{
+    return s_connected;
 }
 
 void wifi_manager_wait_connected(void)
