@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../../work1/EMG/nrf54l15_blinky2/nrf54l15_blinky4"
+		}
+	],
+	"settings": {
+		"clangd.arguments": [
+			"--background-index",
+			"--query-driver=D:\\Espressif\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+			"--compile-commands-dir=${workspaceFolder}\\build"
+		]
+	}
+}

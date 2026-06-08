@@ -8,6 +8,7 @@
 #include "ads1298_stream.h"
 #include "lsm9ds1.h"
 #include "imu_stream.h"
+#include "led_ctrl.h"
 
 static const char *TAG = "main";
 
@@ -38,6 +39,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     log_memory_snapshot("nvs_ready");
+
+    led_ctrl_init();
+    log_memory_snapshot("led_ready");
 
     wifi_manager_init();
     wifi_manager_wait_connected();
