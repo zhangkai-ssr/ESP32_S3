@@ -89,7 +89,14 @@ sudo nmcli connection up orangepi-ap
 → ADS1298 进入 quiet state（早期问题，PMIC 修复后已消失）。
 → 若再现，按从机 RESET 物理按键，让 chip 上电重启。
 
-### 现象 G: 主机 `journalctl -u sensor-host` 无 `slave connected`
+### 现象 G1: 16 通道都有数据但 chip-A 和 chip-B 信号 std 差 10 倍
+→ Daisy chain 协议 OK（无丢包），但其中一片 ADS1298 的输入端悬空或电极接触不良。
+→ 用 `scripts/verify_16ch.py /tmp/runN_emg.npz` 看各通道 std:
+- 正常 EMG: std 数十万级
+- 输入悬空: std 数百万级（接近 24-bit 满量程 ±8M）
+→ 检查这片的：(a) 电极是否接好  (b) RLDIN/RLDREF 是否连接  (c) AVDD 是否稳定
+
+### 现象 G2: 主机 `journalctl -u sensor-host` 无 `slave connected`
 → 检查 `arp -n | grep 10.42.0.76`：
 - 显示 `(incomplete)` → 从机没真正在 AP 上关联
 - 显示 MAC `70:04:1d:d8:1a:38` → 路由 OK，看从机 TCP 出口
