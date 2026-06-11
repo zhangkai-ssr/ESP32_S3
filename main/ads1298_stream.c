@@ -189,6 +189,10 @@ void ads1298_stream_init(void)
 
 void ads1298_stream_start(void)
 {
-    xTaskCreate(tcp_client_task, "ads1298_tcp", 8192, NULL, 4, NULL);
-    ESP_LOGI(TAG, "EMG TCP client task started");
+    /* Pin to CPU1: WiFi runs on CPU0 by default and aggressively preempts
+     * tasks on the same core during TX/RX bursts. Putting the EMG loop on
+     * CPU1 isolates the SPI/DRDY-driven sample collection path. Empirically
+     * this is the single highest-impact change for sustained EMG throughput. */
+    xTaskCreatePinnedToCore(tcp_client_task, "ads1298_tcp", 8192, NULL, 4, NULL, 1);
+    ESP_LOGI(TAG, "EMG TCP client task started on CPU1");
 }
