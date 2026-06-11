@@ -22,6 +22,32 @@
 
 **主机端动作**: sensor-host 暂停（已 stop），避免 TCP 干扰单纯测 DRDY。
 
-**结果**: 待用户烧录后贴日志
+**结果 (E1)**: WiFi 关联成功但 DHCP 失败（4-way handshake OK，IP 拿不到），
+ADS1298 init 阶段被 `wifi_manager_wait_connected` 阻塞，无法验证。
+
+主机端确认：
+- `iw dev wlan0 station dump` 能看到 STA `70:04:1d:d8:1a:38` 已关联
+- `dnsmasq` 收不到任何 DHCP 包
+- arp 表 `10.42.0.76 (incomplete)` 反向 ARP 失败
+
+→ 触发 E1b 补丁解 WiFi。
+
+---
+
+## E1b - 静态 IP 替代 DHCP，unblock E1
+
+**目的**: 跳过 DHCP，让 ESP32 直接用 10.42.0.76 静态 IP。这样 `wifi_manager_wait_connected`
+能在关联后立即返回（因为 IP 提前已经设了），main 流程进入 ADS1298 init，
+然后我们才能看到 DRDY 诊断行。
+
+**Patch**: wifi_manager.c 加 `STATIC_IP_ENABLED 1`，在 `esp_netif_create_default_wifi_sta`
+后调用 `esp_netif_dhcpc_stop` + `esp_netif_set_ip_info`。
+
+**预期日志**:
+- 启动后看到 `static IP configured: 10.42.0.76/255.255.255.0 gw 10.42.0.1`
+- WiFi 关联成功后立即看到 `ADS1298 init start`（不再卡在 DHCP）
+- 主机端 `arp -n` 应该能解析到 `10.42.0.76`
+
+**结果**: 待用户烧录
 
 ---

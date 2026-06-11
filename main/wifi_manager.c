@@ -41,11 +41,34 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+/* Static IP fallback for boards whose ESP32 DHCP client fails to negotiate
+ * with the Orange Pi nmcli-shared AP. Same /24 as the AP's DHCP pool, but
+ * outside the dnsmasq range 10.42.0.10..254 to avoid collisions.
+ *
+ * Set STATIC_IP_ENABLED to 0 to fall back to DHCP. */
+#define STATIC_IP_ENABLED   1
+#define STATIC_IP_ADDR      "10.42.0.76"
+#define STATIC_IP_NETMASK   "255.255.255.0"
+#define STATIC_IP_GATEWAY   "10.42.0.1"
+
 void wifi_manager_init(void)
 {
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+#if STATIC_IP_ENABLED
+    /* Stop DHCP client BEFORE setting static IP, otherwise NetIF rejects it. */
+    esp_netif_dhcpc_stop(sta_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr      = esp_ip4addr_aton(STATIC_IP_ADDR);
+    ip_info.netmask.addr = esp_ip4addr_aton(STATIC_IP_NETMASK);
+    ip_info.gw.addr      = esp_ip4addr_aton(STATIC_IP_GATEWAY);
+    esp_netif_set_ip_info(sta_netif, &ip_info);
+    ESP_LOGI(TAG, "static IP configured: %s/%s gw %s",
+             STATIC_IP_ADDR, STATIC_IP_NETMASK, STATIC_IP_GATEWAY);
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
