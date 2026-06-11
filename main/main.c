@@ -9,6 +9,7 @@
 #include "lsm9ds1.h"
 #include "imu_stream.h"
 #include "led_ctrl.h"
+#include "npm1300_led.h"   /* for npm1300_enable_sensor_rails() */
 
 static const char *TAG = "main";
 
@@ -42,6 +43,16 @@ void app_main(void)
 
     led_ctrl_init();
     log_memory_snapshot("led_ready");
+
+    /* Enable BUCK1/LDO1/LDO2 BEFORE talking to sensors. NPM1300 default
+     * leaves these rails OFF; without this call ADS1298 has no AVDD and
+     * IMU has no power. Must happen AFTER led_ctrl_init() (which installs
+     * the I2C bus driver). Failure here is non-fatal — we still let the
+     * board boot WiFi so we can SSH-debug. */
+    if (npm1300_enable_sensor_rails() != ESP_OK) {
+        ESP_LOGE(TAG, "sensor rails enable FAILED — sensors will not respond");
+    }
+    log_memory_snapshot("rails_enabled");
 
     wifi_manager_init();
     wifi_manager_wait_connected();

@@ -39,6 +39,24 @@
 esp_err_t npm1300_led_init(void);
 
 /**
+ * @brief  Enable BUCK1 (3.3V for IMU + FLASH), LDO1 (3.3V for ADS1298-A),
+ *         LDO2 (3.3V for ADS1298-B). Must be called AFTER npm1300_led_init()
+ *         (which installs the I2C driver) and BEFORE ads1298_init() /
+ *         lsm9ds1_init().
+ *
+ *         Per the schematic on this board:
+ *           BUCK1 → IMU + FLASH (3.3V rail)
+ *           LDO1  → ADS1298-A + YOSC-A
+ *           LDO2  → ADS1298-B + YOSC-B
+ *
+ *         NPM1300 factory default leaves these rails DISABLED. Firmware must
+ *         configure mode (LDSW vs LDO) + voltage + enable explicitly.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t npm1300_enable_sensor_rails(void);
+
+/**
  * @brief  Directly set the on/off state of each RGB channel.
  *         This is the only hardware write path; call it only from the
  *         led_ctrl layer to keep I2C traffic minimal.
