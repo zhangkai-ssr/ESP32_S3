@@ -46,8 +46,12 @@ static const char *TAG = "npm1300_led";
 #define NPM1300_LDSW1_ENACLR    0x01
 #define NPM1300_LDSW2_ENASET    0x02    /* TASKLDSW2SET — enable LDO2 */
 #define NPM1300_LDSW2_ENACLR    0x03
-#define NPM1300_LDSW_STATUS     0x04    /* bit0=LDO1 on, bit2=LDO2 on */
-#define NPM1300_LDSW_LDOSEL     0x08    /* bit0=LDO1 LDO/LDSW, bit1=LDO2 */
+#define NPM1300_LDSW_STATUS     0x04    /* bit0-1=LDSW1, bit2-3=LDSW2 */
+/* Per Zephyr regulator_npm1300.c: LDSW mode select is per-channel, with
+ * channel offset added. So LDSW1 mode is at 0x08, LDSW2 mode at 0x09.
+ * Each register is a SINGLE BIT (1=LDO mode, 0=LDSW mode). */
+#define NPM1300_LDSW1_LDOSEL    0x08
+#define NPM1300_LDSW2_LDOSEL    0x09
 #define NPM1300_LDSW1_VOUTSEL   0x0C    /* voltage = 1000 + val*100 mV */
 #define NPM1300_LDSW2_VOUTSEL   0x0D
 
@@ -190,10 +194,16 @@ esp_err_t npm1300_enable_sensor_rails(void)
     ESP_LOGI(TAG, "BUCK1 enabled @ 3300mV (IMU+FLASH rail)");
 
     /* ---- LDO1 + LDO2 ---- */
-    /* Mode: LDO1 = LDO, LDO2 = LDO (bit0 + bit1 set) — needed for adjustable
-     * voltage; LDSW mode just passes BUCK output through unregulated. */
-    ret = npm1300_write_verify("LDOSEL", NPM1300_LDSW_PAGE,
-                               NPM1300_LDSW_LDOSEL, 0x03, 0x03);
+    /* Mode select is PER-CHANNEL (two separate registers, each 1-bit):
+     *   LDSW1 mode → 0x08, LDSW2 mode → 0x09
+     *   1 = LDO (regulated), 0 = LDSW (load switch passthrough)
+     * (Per Zephyr regulator_npm1300.c source.)
+     */
+    ret = npm1300_write_verify("LDO1_MODE", NPM1300_LDSW_PAGE,
+                               NPM1300_LDSW1_LDOSEL, 0x01, 0x01);
+    if (ret != ESP_OK) return ret;
+    ret = npm1300_write_verify("LDO2_MODE", NPM1300_LDSW_PAGE,
+                               NPM1300_LDSW2_LDOSEL, 0x01, 0x01);
     if (ret != ESP_OK) return ret;
 
     ret = npm1300_write_verify("LDO1_VOUT", NPM1300_LDSW_PAGE,
@@ -232,6 +242,7 @@ esp_err_t npm1300_enable_sensor_rails(void)
     cmd[0] = NPM1300_LDSW_PAGE; cmd[1] = NPM1300_LDSW_STATUS;
     if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                      cmd, 2, &val, 1, pdMS_TO_TICKS(10)) == ESP_OK) {
+        /* LDSW1_ON_MASK=0x03 (bits 0-1), LDSW2_ON_MASK=0x0C (bits 2-3) */
         ESP_LOGI(TAG, "LDSW_STATUS = 0x%02X (LDO1 %s, LDO2 %s)", val,
                  (val & 0x03) ? "ON" : "OFF",
                  (val & 0x0C) ? "ON" : "OFF");

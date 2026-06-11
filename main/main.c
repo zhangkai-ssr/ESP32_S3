@@ -31,6 +31,10 @@ static void log_memory_snapshot(const char *stage)
 
 void app_main(void)
 {
+    /* Give the host serial monitor 1.5s to sync — otherwise on a fast boot
+     * we lose the first ~1s of log output to the bytestream-resync delay. */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
     log_memory_snapshot("boot");
 
     esp_err_t ret = nvs_flash_init();
