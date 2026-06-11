@@ -48,9 +48,8 @@ static inline void cs_deassert(void)
     gpio_set_level(ADS1298_PIN_CS, 1);
 }
 
-/* DMA-safe static buffers; max transaction = 55 (data + dead-bit byte) for
- * daisy-chain read, or 1 (cmd) + 54 (data) = 55 bytes for command paths. */
-#define SPI_BUF_SIZE  64
+/* DMA-safe static buffers; max transaction = 1 (cmd) + 54 (data) = 55 bytes */
+#define SPI_BUF_SIZE  56
 static uint8_t s_tx_buf[SPI_BUF_SIZE];
 static uint8_t s_rx_buf[SPI_BUF_SIZE];
 
@@ -127,45 +126,24 @@ esp_err_t ads1298_read_data(uint8_t *buf, size_t len)
     if (len < ADS1298_TOTAL_DATA_SIZE) {
         return ESP_ERR_INVALID_ARG;
     }
-
-#if ADS1298_CHAIN_DEVICES == 2
-    /* DAISY-CHAIN DEAD-BIT COMPENSATION:
-     * Per ADS1298 datasheet §9.4.1, in daisy-chain mode the chip inserts ONE
-     * 'don't care' bit between each device's 216-bit data frame. So the
-     * actual bit stream is:
-     *     [216 bits chip A][1 dead bit][216 bits chip B] = 433 bits
-     * Naively reading 54 bytes (= 432 bits) gives chip A correctly, but
-     * chip B comes out right-shifted by 1 bit (its status byte 0xC* reads
-     * as 0x60 = 1100... shifted right 1).
+    /* RDATAC mode: assert CS when DRDY low, clock out data directly (no command byte).
      *
-     * Fix: read 55 bytes (= 440 bits), then shift the chip-B half left by
-     * 1 bit, pulling in the borrowed MSB from the following byte. The very
-     * last bit (bit 432 in the 440-bit window) is ignored. */
-    uint8_t tx[ADS1298_TOTAL_DATA_SIZE + 1] = {0};
-    uint8_t rx[ADS1298_TOTAL_DATA_SIZE + 1];
-    cs_assert();
-    esp_err_t ret = spi_rw(tx, rx, sizeof(rx));
-    cs_deassert();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    /* chip A: 27 bytes verbatim */
-    memcpy(buf, rx, ADS1298_DATA_FRAME_SIZE);
-    /* chip B: shift left 1 bit across the (27+1)-byte window */
-    for (int i = 0; i < ADS1298_DATA_FRAME_SIZE; i++) {
-        size_t idx = ADS1298_DATA_FRAME_SIZE + i;   /* 27..53 in rx */
-        buf[idx] = (uint8_t)((rx[idx] << 1) | (rx[idx + 1] >> 7));
-    }
-    return ESP_OK;
-#else
-    /* Single-chip or N>2 chain: no dead-bit handling here (would need N-1
-     * sequential 1-bit shifts; expand only if you actually have 3+ chips). */
+     * NOTE on daisy-chain dead bit:
+     * ADS1298 inserts 1 'don't care' bit between each device's 216-bit data
+     * frame. Compensating on the firmware side by reading an extra byte and
+     * shifting introduced a race condition (likely SPI/DRDY timing margin
+     * shrinking) that cut throughput in half and corrupted 18% of packets.
+     *
+     * Decision: keep the firmware reading 54 bytes as before (stable 2000 pkt/s),
+     * apply the 1-bit left-shift to chip B data on the host side in
+     * align_streams.py / parsers. The dead bit then manifests as chip B
+     * status reading 0x60 instead of 0xC0 in the raw stream, which the host
+     * tools handle uniformly. */
     uint8_t tx[ADS1298_TOTAL_DATA_SIZE] = {0};
     cs_assert();
     esp_err_t ret = spi_rw(tx, buf, ADS1298_TOTAL_DATA_SIZE);
     cs_deassert();
     return ret;
-#endif
 }
 
 esp_err_t ads1298_wait_drdy(uint32_t timeout_ms)
@@ -331,7 +309,7 @@ esp_err_t ads1298_init(void)
         .sclk_io_num     = ADS1298_PIN_SCLK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = 1 + ADS1298_TOTAL_DATA_SIZE + 1,  /* + dead-bit byte */
+        .max_transfer_sz = 1 + ADS1298_TOTAL_DATA_SIZE,
     };
     ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_DISABLED);
     if (ret != ESP_OK) {
