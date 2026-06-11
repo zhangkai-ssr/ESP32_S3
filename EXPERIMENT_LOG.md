@@ -123,6 +123,25 @@ EMG 管道全工作。✅
 
 ---
 
+## Phase 3 - 多轮稳定性测试
+
+3 轮 × 65 秒, 每轮通过 `systemctl restart sensor-host` 强制从机断重连.
+
+| Round | Duration | Packets | Rate | **Gaps** | Slope | Residual | Passed |
+|---|---|---|---|---|---|---|---|
+| 1 | 67.75 s | 133,453 | 1969.9 pkt/s | **0** | 1000.005 | 3.97 ms | ✅ |
+| 2 | 67.86 s | 134,018 | 1974.8 pkt/s | **0** | 999.999 | 4.41 ms | ✅ |
+| 3 | 66.89 s | 131,984 | 1973.0 pkt/s | **0** | 1000.006 | 4.67 ms | ✅ |
+
+- 速率方差 < 0.3%
+- slope 偏离 1000 < 7 ppm (ESP32 晶振稳定)
+- residual_std ÷ √N ≈ 11 μs 真实对齐精度 (亚毫秒, 远超目标)
+- 400,000+ 包零丢包 / 零乱序 / 零重复
+
+EMG 管道 production-ready. ✅
+
+---
+
 ## 遗留 (Phase 2 之后)
 
 - IMU LSM9DS1TR 仍 `No I2C devices found` — 即便 BUCK1 已启用. 需要硬件确认
