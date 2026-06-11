@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process *)",
+      "PowerShell($ws = New-Object -ComObject WScript.Shell; $shortcut = $ws.CreateShortcut\\(\"D:\\\\work1\\\\EMG\\\\nrf54l15_blinky2\\\\nrf54l15_blinky4\\\\cdnrf.lnk\"\\); $shortcut.TargetPath = \"D:\\\\work1\\\\EMG\\\\nrf54l15_blinky2\\\\nrf54l15_blinky4\"; $shortcut.WorkingDirectory = \"D:\\\\work1\\\\EMG\\\\nrf54l15_blinky2\\\\nrf54l15_blinky4\"; $shortcut.IconLocation = \"C:\\\\Windows\\\\System32\\\\shell32.dll,3\"; $shortcut.Save\\(\\))",
+      "PowerShell($profilePath = $PROFILE; $profileDir = Split-Path $profilePath -Parent; if \\(-not \\(Test-Path $profileDir\\)\\) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }; if \\(-not \\(Test-Path $profilePath\\)\\) { New-Item -ItemType File -Path $profilePath | Out-Null }; $content = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue; if \\($content -notmatch \"function\\\\s+cdnrf\\\\b\"\\) { Add-Content -Path $profilePath -Value \"`r`nfunction cdnrf { Set-Location 'D:\\\\work1\\\\EMG\\\\nrf54l15_blinky2\\\\nrf54l15_blinky4' }`r`n\" })"
+    ]
+  }
+}

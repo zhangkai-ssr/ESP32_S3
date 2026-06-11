@@ -18,7 +18,11 @@
 #define TIMESTAMP_BYTES     4
 #define PAYLOAD_SIZE        (ADS1298_CHAIN_DEVICES * ADS1298_DATA_FRAME_SIZE)
 #define PACKET_SIZE         (1 + 1 + 2 + TIMESTAMP_BYTES + 1 + PAYLOAD_SIZE + 1)
-#define TCP_PORT            3333
+
+/* TCP-client mode: connect to the Orange Pi host (AP gateway). */
+#define HOST_IP             "10.42.0.1"
+#define HOST_PORT           3333
+#define RECONNECT_DELAY_MS  1000
 #define BATCH_FRAMES        50
 #define BATCH_BYTES         (PACKET_SIZE * BATCH_FRAMES)
 #define DRDY_TIMEOUT_MS     50
@@ -113,54 +117,45 @@ static size_t build_batch(uint8_t *buf, size_t capacity, uint16_t frames)
     return total;
 }
 
-static void tcp_server_task(void *pvParameters)
+/* Connect to the host. Blocks (with retry) until we have a usable socket. */
+static int connect_to_host(void)
 {
-    struct sockaddr_in server_addr = {
+    struct sockaddr_in dest = {
         .sin_family      = AF_INET,
-        .sin_port        = htons(TCP_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port        = htons(HOST_PORT),
+        .sin_addr.s_addr = inet_addr(HOST_IP),
     };
 
-    int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "socket create failed: errno=%d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int reuse = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    if (bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
-        ESP_LOGE(TAG, "bind failed: errno=%d", errno);
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (listen(listen_sock, 1) != 0) {
-        ESP_LOGE(TAG, "listen failed: errno=%d", errno);
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "TCP stream server listening on port %d", TCP_PORT);
-    log_stream_memory("listen");
-
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &client_len);
-        if (client_sock < 0) {
-            ESP_LOGW(TAG, "accept failed: errno=%d", errno);
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
             continue;
         }
-
+        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
+            ESP_LOGW(TAG, "connect %s:%d failed: errno=%d, retry in %d ms",
+                     HOST_IP, HOST_PORT, errno, RECONNECT_DELAY_MS);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
         int flag = 1;
-        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        ESP_LOGI(TAG, "client connected, streaming ADS1298 data @ 2000 SPS");
-        log_stream_memory("client_connected");
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+        ESP_LOGI(TAG, "connected to %s:%d, streaming ADS1298 @ 2000 SPS",
+                 HOST_IP, HOST_PORT);
+        log_stream_memory("connected");
+        return sock;
+    }
+}
+
+static void tcp_client_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "EMG TCP client target: %s:%d", HOST_IP, HOST_PORT);
+
+    while (1) {
+        int sock = connect_to_host();
 
         while (1) {
             size_t len = build_batch(s_batch_buf, sizeof(s_batch_buf), BATCH_FRAMES);
@@ -168,17 +163,18 @@ static void tcp_server_task(void *pvParameters)
                 ESP_LOGE(TAG, "batch build failed");
                 break;
             }
-            if (send(client_sock, (const char *)s_batch_buf, (int)len, 0) < 0) {
-                ESP_LOGW(TAG, "send failed: errno=%d", errno);
+            if (send(sock, (const char *)s_batch_buf, (int)len, 0) < 0) {
+                ESP_LOGW(TAG, "send failed: errno=%d, reconnecting", errno);
                 log_stream_memory("send_failed");
                 break;
             }
         }
 
-        shutdown(client_sock, 0);
-        close(client_sock);
-        log_stream_memory("client_disconnected");
-        ESP_LOGI(TAG, "client disconnected");
+        shutdown(sock, 0);
+        close(sock);
+        log_stream_memory("disconnected");
+        ESP_LOGI(TAG, "EMG connection dropped, will reconnect");
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 }
 
@@ -193,6 +189,6 @@ void ads1298_stream_init(void)
 
 void ads1298_stream_start(void)
 {
-    xTaskCreate(tcp_server_task, "ads1298_tcp", 8192, NULL, 4, NULL);
-    ESP_LOGI(TAG, "TCP stream task started");
+    xTaskCreate(tcp_client_task, "ads1298_tcp", 8192, NULL, 4, NULL);
+    ESP_LOGI(TAG, "EMG TCP client task started");
 }

@@ -1,11 +1,12 @@
 /*
- * imu_stream.c – LSM9DS1TR 9-axis raw data streaming over WiFi TCP
+ * imu_stream.c – LSM9DS1TR 9-axis raw data streaming over WiFi TCP (CLIENT mode)
  *
  * Architecture:
  *   imu_sample_task   – 200 Hz, driven by esp_timer ISR + binary semaphore.
  *                       Reads 9-axis raw counts and pushes to a FreeRTOS queue.
- *   tcp_server_task   – Waits for a client, drains the queue in batches of
- *                       IMU_BATCH_SAMPLES and sends one TCP packet per batch.
+ *   tcp_client_task   – Connects to the host (Orange Pi AP gateway), drains
+ *                       the queue in batches of IMU_BATCH_SAMPLES, sends one
+ *                       TCP packet per batch. Reconnects on failure.
  *
  * TCP Packet format (211 bytes for IMU_BATCH_SAMPLES = 10):
  *   [0]       0xBB          header  (IMU frame, distinct from EMG 0xAA)
@@ -19,7 +20,7 @@
  *   [last]    0x55          footer
  *
  * Packet rate: 200 Hz / 10 = 20 packets/s
- * Port: 3334  (ADS1298 EMG uses 3333)
+ * Host: 10.42.0.1:3334  (ADS1298 EMG uses :3333)
  *
  * Sensor config: AG 238 Hz ±4g / ±500 dps,  M 40 Hz ±8 gauss
  */
@@ -43,7 +44,9 @@
 static const char *TAG = "imu_stream";
 
 /* ---- Protocol constants ---- */
-#define IMU_TCP_PORT        3334
+#define HOST_IP             "10.42.0.1"
+#define HOST_PORT           3334
+#define RECONNECT_DELAY_MS  1000
 #define IMU_SAMPLE_HZ       200
 #define IMU_BATCH_SAMPLES   10        /* samples per TCP packet → 20 pkt/s */
 
@@ -199,47 +202,49 @@ static size_t build_packet(uint8_t *buf)
     return off; /* should equal PACKET_SIZE */
 }
 
-/* ---- TCP server task ---- */
-static void tcp_server_task(void *pv)
+/* Connect to the host. Blocks (with retry) until socket is up. */
+static int connect_to_host(void)
 {
-    struct sockaddr_in addr = {
+    struct sockaddr_in dest = {
         .sin_family      = AF_INET,
-        .sin_port        = htons(IMU_TCP_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port        = htons(HOST_PORT),
+        .sin_addr.s_addr = inet_addr(HOST_IP),
     };
 
-    int lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (lsock < 0) {
-        ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-    int reuse = 1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGE(TAG, "bind() failed: errno=%d", errno);
-        close(lsock);
-        vTaskDelete(NULL);
-        return;
-    }
-    listen(lsock, 1);
-    ESP_LOGI(TAG, "IMU TCP server listening on port %d (%dB/pkt, %d pkt/s, LSM9DS1TR 9-axis)",
-             IMU_TCP_PORT, PACKET_SIZE, IMU_SAMPLE_HZ / IMU_BATCH_SAMPLES);
-    log_imu_memory("listen");
-
     while (1) {
-        struct sockaddr_in cli;
-        socklen_t cli_len = sizeof(cli);
-        int csock = accept(lsock, (struct sockaddr *)&cli, &cli_len);
-        if (csock < 0) {
-            ESP_LOGW(TAG, "accept() failed: errno=%d", errno);
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
             continue;
         }
-        ESP_LOGI(TAG, "IMU client connected – streaming @ %d Hz (9-axis)", IMU_SAMPLE_HZ);
-        log_imu_memory("client_connected");
+        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
+            ESP_LOGW(TAG, "connect %s:%d failed: errno=%d, retry in %d ms",
+                     HOST_IP, HOST_PORT, errno, RECONNECT_DELAY_MS);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+        ESP_LOGI(TAG, "IMU connected to %s:%d, streaming @ %d Hz (9-axis)",
+                 HOST_IP, HOST_PORT, IMU_SAMPLE_HZ);
+        log_imu_memory("connected");
+        return sock;
+    }
+}
 
-        /* Flush stale queued samples so client always gets fresh data */
+/* ---- TCP client task ---- */
+static void tcp_client_task(void *pv)
+{
+    ESP_LOGI(TAG, "IMU TCP client target: %s:%d (%dB/pkt, %d pkt/s, LSM9DS1TR 9-axis)",
+             HOST_IP, HOST_PORT, PACKET_SIZE, IMU_SAMPLE_HZ / IMU_BATCH_SAMPLES);
+
+    while (1) {
+        int sock = connect_to_host();
+
+        /* Flush stale queued samples so host always gets fresh data */
         xQueueReset(s_queue);
         s_client_active = true;
 
@@ -249,18 +254,19 @@ static void tcp_server_task(void *pv)
                 ESP_LOGE(TAG, "build_packet failed");
                 break;
             }
-            if (send(csock, (const char *)s_packet, (int)len, 0) < 0) {
-                ESP_LOGW(TAG, "send() failed: errno=%d", errno);
+            if (send(sock, (const char *)s_packet, (int)len, 0) < 0) {
+                ESP_LOGW(TAG, "send() failed: errno=%d, reconnecting", errno);
                 log_imu_memory("send_failed");
                 break;
             }
         }
 
         s_client_active = false;
-        shutdown(csock, 0);
-        close(csock);
-        log_imu_memory("client_disconnected");
-        ESP_LOGI(TAG, "IMU client disconnected");
+        shutdown(sock, 0);
+        close(sock);
+        log_imu_memory("disconnected");
+        ESP_LOGI(TAG, "IMU connection dropped, will reconnect");
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 }
 
@@ -284,6 +290,6 @@ void imu_stream_start(void)
 {
     /* Priority 7: higher than TCP task (5) so sampling is not starved */
     xTaskCreate(imu_sample_task, "imu_sample", 4096, NULL, 7, NULL);
-    xTaskCreate(tcp_server_task, "imu_tcp",    4096, NULL, 5, NULL);
+    xTaskCreate(tcp_client_task, "imu_tcp",    4096, NULL, 5, NULL);
     ESP_LOGI(TAG, "IMU stream tasks started");
 }
