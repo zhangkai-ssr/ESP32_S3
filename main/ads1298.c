@@ -319,7 +319,7 @@ esp_err_t ads1298_init(void)
 
     /* SPI device: Mode 1 (CPOL=0, CPHA=1), CS driven manually */
     const spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 4 * 1000 * 1000,   /* 4 MHz (ADS1298 max: 20 MHz) */
+        .clock_speed_hz = 10 * 1000 * 1000,  /* 10 MHz (ADS1298 max: 20 MHz) */
         .mode           = 1,                   /* CPHA=1, CPOL=0 */
         .spics_io_num   = -1,                  /* manual CS */
         .queue_size     = 1,
