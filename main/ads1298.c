@@ -39,7 +39,10 @@ static void IRAM_ATTR drdy_isr_handler(void *arg)
 static inline void cs_assert(void)
 {
     gpio_set_level(ADS1298_PIN_CS, 0);
-    esp_rom_delay_us(1);
+    /* In daisy-chain mode, both chips need a few microseconds after CS goes
+     * low for their shift registers to align before the first SCLK.
+     * 1 us proved unreliable once chip B started actively driving the chain. */
+    esp_rom_delay_us(5);
 }
 
 static inline void cs_deassert(void)
@@ -319,7 +322,8 @@ esp_err_t ads1298_init(void)
 
     /* SPI device: Mode 1 (CPOL=0, CPHA=1), CS driven manually */
     const spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 10 * 1000 * 1000,  /* 10 MHz (ADS1298 max: 20 MHz) */
+        .clock_speed_hz = 4 * 1000 * 1000,   /* 4 MHz: matches Phase-3 stable; daisy chain SCLK
+                                              * datasheet limit is fCLK/8 = 256 kHz but works empirically. */
         .mode           = 1,                   /* CPHA=1, CPOL=0 */
         .spics_io_num   = -1,                  /* manual CS */
         .queue_size     = 1,
