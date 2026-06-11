@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM29",
+  "idf.portWin": "COM13",
   "idf.toolsPathWin": "D:\\Espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -17,7 +17,7 @@
     "--compile-commands-dir=${workspaceFolder}\\build"
   ],
   "idf.flashType": "UART",
-  "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.3.1/",
+  "idf.currentSetup": "D:/work3/Espressif/frameworks/esp-idf-v5.3.1/",
   "python.testing.unittestArgs": [
     "-v",
     "-s",

@@ -71,8 +71,19 @@ void app_main(void)
         log_memory_snapshot("imu_disabled");
         ESP_LOGI(TAG, "System ready  EMG TCP:3333  (IMU not present)");
     }
+    uint32_t last_isr = 0;
     while (1) {
         log_memory_snapshot("heartbeat");
+        /* Diagnostic: every 5s print DRDY counters so we can see if the
+         * ADS1298 is still producing samples even when TCP is down. */
+        uint32_t isr = 0, take = 0, ovf = 0;
+        ads1298_drdy_stats(&isr, &take, &ovf);
+        ESP_LOGI(TAG, "DRDY: isr=%lu (+%lu in 5s) take=%lu overflow=%lu",
+                 (unsigned long)isr,
+                 (unsigned long)(isr - last_isr),
+                 (unsigned long)take,
+                 (unsigned long)ovf);
+        last_isr = isr;
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
 }

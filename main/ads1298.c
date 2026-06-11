@@ -201,15 +201,37 @@ static void ads1298_hw_reset(void)
 
 esp_err_t ads1298_start_conversion(void)
 {
+    /* Per ADS1298 datasheet "Setting the Device for Basic Data Capture":
+     * After writing CONFIG3 (PD_REFBUF=1) we MUST wait tWAIT_VCAP1 (typ 150 ms,
+     * max 250 ms) for the internal reference buffer to stabilise. Without this
+     * delay the ADC modulator never starts and DRDY stays high forever, even
+     * though chip ID and register read-back work (those only need DVDD). */
+    vTaskDelay(pdMS_TO_TICKS(250));
+
     ads1298_send_command(ADS1298_CMD_SDATAC);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    /* Explicit WAKEUP in case a stale STANDBY survived the soft reset path. */
+    ads1298_send_command(ADS1298_CMD_WAKEUP);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
     xSemaphoreTake(s_drdy_sem, 0);             /* flush any stale counts */
     s_drdy_isr_count      = 0;
     s_drdy_take_count     = 0;
     s_drdy_overflow_count = 0;
+
     gpio_set_level(ADS1298_PIN_START, 1);
-    ads1298_send_command(ADS1298_CMD_START);   /* software START (belt-and-suspenders) */
-    vTaskDelay(pdMS_TO_TICKS(2));              /* wait for first conversion to complete */
-    ads1298_send_command(ADS1298_CMD_RDATAC);  /* continuous data ready mode */
+    vTaskDelay(pdMS_TO_TICKS(2));
+    ads1298_send_command(ADS1298_CMD_START);
+    vTaskDelay(pdMS_TO_TICKS(20));             /* let several conversions complete */
+    ads1298_send_command(ADS1298_CMD_RDATAC);
+
+    /* Sanity: by now isr_count should be >0 if hardware is healthy. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_LOGI(TAG, "start_conversion done; DRDY isr_count after 50 ms = %lu, "
+                  "GPIO%d level = %d",
+             (unsigned long)s_drdy_isr_count,
+             ADS1298_PIN_DRDY, gpio_get_level(ADS1298_PIN_DRDY));
     return ESP_OK;
 }
 

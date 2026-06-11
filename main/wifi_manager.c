@@ -60,9 +60,13 @@ void wifi_manager_init(void)
         .sta = {
             .scan_method = WIFI_ALL_CHANNEL_SCAN,
             .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* Looser threshold tolerates APs that announce WPA-WPA2 mixed mode.
+             * Some ESP32-S3 RF modules fail the 4-way handshake when the AP
+             * advertises PMF capability but the STA also announces capable=true
+             * — disabling PMF entirely on the STA side fixes it. */
+            .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
             .pmf_cfg = {
-                .capable  = true,
+                .capable  = false,
                 .required = false,
             },
         },
