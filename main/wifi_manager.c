@@ -8,7 +8,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 
-#define WIFI_PROFILE 2   /* 1 = CYZX05, 2 = S50 */
+#define WIFI_PROFILE 3  /* 1 = CYZX05, 2 = S50, 3 = OrangePi_AP */
 
 #if WIFI_PROFILE == 1
 #define WIFI_SSID   "CYZX05"
@@ -16,8 +16,11 @@
 #elif WIFI_PROFILE == 2
 #define WIFI_SSID   "S50"
 #define WIFI_PASS   "12345678qwe"
+#elif WIFI_PROFILE == 3
+#define WIFI_SSID   "OrangePi_AP"
+#define WIFI_PASS   "op_sensor_2025"
 #else
-#error "Unknown WIFI_PROFILE, set to 1 or 2"
+#error "Unknown WIFI_PROFILE, set to 1, 2 or 3"
 #endif
 
 static const char *TAG = "wifi_manager";
