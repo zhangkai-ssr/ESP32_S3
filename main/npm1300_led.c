@@ -339,30 +339,39 @@ esp_err_t npm1300_enable_charger(void)
 
 void npm1300_log_charger_status(void)
 {
-    uint8_t cmd[2];
-    uint8_t vbus = 0, bchg = 0;
+    /* Lightweight path: one I2C read per call (BCHG_STATUS) — that's what
+     * we hand to every 5 s main heartbeat. Full dump (12 I2C reads + ADC)
+     * only runs when the BCHG state byte changes OR every 60 s as a sanity
+     * tick. Earlier "always-dump" version was pushing CPU0 hard enough to
+     * trip the interrupt watchdog and to halve EMG throughput from 1980 to
+     * ~1000 pkt/s.
+     *
+     * BCHGCHARGESTATUS bits:
+     *  0=bat_det 1=complete 2=trickle 3=CC 4=CV 5=recharge 6=NTC_warm 7=supplement
+     */
+    static uint8_t  s_last_bchg   = 0xFF;   /* impossible value → force first dump */
+    static uint32_t s_calls_since_dump = 0;
 
-    cmd[0] = NPM1300_VBUS_PAGE; cmd[1] = NPM1300_VBUS_STATUS;
-    if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
-                                     cmd, 2, &vbus, 1, pdMS_TO_TICKS(10)) != ESP_OK) {
-        ESP_LOGW(TAG, "CHG: VBUS read failed");
-        return;
-    }
+    uint8_t cmd[2];
+    uint8_t bchg = 0;
+
     cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_STATUS;
     if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                      cmd, 2, &bchg, 1, pdMS_TO_TICKS(10)) != ESP_OK) {
         ESP_LOGW(TAG, "CHG: BCHG_STATUS read failed");
         return;
     }
-    /* BCHGCHARGESTATUS bits:
-     *  0 = battery_detected
-     *  1 = charging_complete
-     *  2 = trickle_charge   (low cell → ~10 % ICHG)
-     *  3 = constant_current (CC, full ICHG)
-     *  4 = constant_voltage (CV, near termination V)
-     *  5 = recharge
-     *  6 = NTC warm/JEITA
-     *  7 = supplement (battery sourcing into VSYS together with VBUS) */
+
+    bool changed = (bchg != s_last_bchg);
+    s_calls_since_dump++;
+    bool periodic = (s_calls_since_dump >= 12);   /* 12 × 5 s = 60 s */
+    if (!changed && !periodic) {
+        return;   /* normal steady-state path: 1 I2C read, no log line */
+    }
+    s_last_bchg = bchg;
+    s_calls_since_dump = 0;
+
+    /* --- expensive path: only on change / every 60 s --- */
     const char *phase =
         (bchg & 0x02) ? "complete"   :
         (bchg & 0x10) ? "CV"         :
@@ -371,64 +380,34 @@ void npm1300_log_charger_status(void)
         (bchg & 0x20) ? "recharge"   :
         (bchg & 0x80) ? "supplement" :
                         "idle";
-    uint8_t err_reason = 0, err_sensor = 0;
+
+    uint8_t vbus = 0, err_reason = 0, err_sensor = 0;
+    cmd[0] = NPM1300_VBUS_PAGE; cmd[1] = NPM1300_VBUS_STATUS;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &vbus, 1, pdMS_TO_TICKS(10));
     cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_ERR_REASON;
     (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                        cmd, 2, &err_reason, 1, pdMS_TO_TICKS(10));
     cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_ERR_SENSOR;
     (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                        cmd, 2, &err_sensor, 1, pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG,
-             "CHG: VBUS=%s BCHG=0x%02X [%s] bat_det=%d err_r=0x%02X err_s=0x%02X",
-             (vbus & 0x01) ? "ON" : "OFF",
-             bchg, phase, (bchg >> 0) & 1, err_reason, err_sensor);
 
-    /* Dump every register we configured at init so we can see, from the
-     * runtime log alone, whether each write actually stuck. The boot-time
-     * dump is often lost to the host serial monitor sync delay. */
-    static const struct { uint8_t page, off; const char *name; } regs[] = {
-        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, "ISETMSB" },
-        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, "ISETLSB" },
-        { NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,   "VTERM"   },
-        { NPM1300_CHGR_PAGE, NPM1300_BCHG_DIS_SET, "DIS_SET" },
-        { NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, "NTCR_SEL"},
-    };
-    char line[160] = "CHG_REGS:";
-    size_t off = strlen(line);
-    for (int i = 0; i < (int)(sizeof(regs)/sizeof(regs[0])); i++) {
-        uint8_t v = 0xFF;
-        cmd[0] = regs[i].page; cmd[1] = regs[i].off;
-        (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
-                                           cmd, 2, &v, 1, pdMS_TO_TICKS(10));
-        off += snprintf(line + off, sizeof(line) - off,
-                        " %s=0x%02X", regs[i].name, v);
-    }
-    ESP_LOGI(TAG, "%s", line);
-
-    /* Read the most recent auto-measurement results.  We do NOT trigger a
-     * fresh single-shot conversion here: the auto sequence (started in
-     * enable_charger via TASK_AUTO) keeps fresh results in 0x11/0x13/0x14,
-     * and writing TASK_VBAT from the main task was tripping the interrupt
-     * watchdog on CPU0 (likely via an nPM1300 INT pulse that nobody handles).
-     */
-    uint8_t vbat_msb = 0, vsys_msb = 0, ntc_msb = 0;
+    uint8_t vbat_msb = 0, ntc_msb = 0;
     cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_VBAT_MSB;
     (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                        cmd, 2, &vbat_msb, 1, pdMS_TO_TICKS(10));
-    cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_VSYS_MSB;
-    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
-                                       cmd, 2, &vsys_msb, 1, pdMS_TO_TICKS(10));
     cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_NTC_MSB;
     (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
                                        cmd, 2, &ntc_msb, 1, pdMS_TO_TICKS(10));
+    unsigned vbat_mv = (5000u * vbat_msb) / 255u;
+    unsigned ntc_mv  = (1000u * ntc_msb)  / 255u;
 
-    /* MSBs are top 8 bits of a 10-bit value (LSBs in 0x18 — ignored for
-     * coarse view).  Convert as: V = vfull * msb / 255 (close enough). */
-    unsigned vbat_mv = (5000u  * vbat_msb) / 255u;
-    unsigned vsys_mv = (6375u  * vsys_msb) / 255u;
-    unsigned ntc_mv  = (1000u  * ntc_msb)  / 255u;
-    ESP_LOGI(TAG, "CHG_ADC: VBAT=%u mV  VSYS=%u mV  NTC=%u mV  (raw 0x%02X/0x%02X/0x%02X)",
-             vbat_mv, vsys_mv, ntc_mv, vbat_msb, vsys_msb, ntc_msb);
+    ESP_LOGI(TAG,
+             "CHG: VBUS=%s BCHG=0x%02X [%s] bat_det=%d err=%02X/%02X VBAT=%umV NTC=%umV (%s)",
+             (vbus & 0x01) ? "ON" : "OFF",
+             bchg, phase, (bchg >> 0) & 1, err_reason, err_sensor,
+             vbat_mv, ntc_mv,
+             changed ? "changed" : "60s tick");
 }
 
 esp_err_t npm1300_enable_sensor_rails(void)
