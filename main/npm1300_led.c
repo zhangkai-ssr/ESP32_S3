@@ -34,14 +34,19 @@ static const char *TAG = "npm1300_led";
 #define NPM1300_LDSW_PAGE       0x08    /* LDSW / LDO regulators */
 #define NPM1300_CHGR_PAGE       0x03    /* battery charger (BCHG) */
 #define NPM1300_VBUS_PAGE       0x02    /* VBUS input limiter */
-#define NPM1300_ADC_PAGE        0x05    /* ADC + NTC config        */
+/* nPM1300 ADC sub-system lives at page 0x05 (per Zephyr mfd_npm1300).
+ * The knowledge-base note that puts ADCNTCRSEL at page 0x02 is wrong on
+ * this PMIC — we verified by reading VBAT through both bases and only the
+ * page 0x05 read returns the real 3.98 V battery voltage. */
+#define NPM1300_ADC_PAGE        0x05
 
 /* ---- ADC page (0x05) offsets ---- */
 #define NPM1300_ADC_TASK_VBAT   0x00    /* 1 = start VBAT measure  */
 #define NPM1300_ADC_NTCR_SEL    0x0A    /* 0 = NTC pull-up disabled */
 #define NPM1300_ADC_TASK_AUTO   0x0C    /* 1 = start auto-temp     */
 #define NPM1300_ADC_VBAT_MSB    0x11    /* VBAT result high byte   */
-#define NPM1300_ADC_NTC_MSB     0x13    /* NTC voltage result MSB  */
+#define NPM1300_ADC_NTC_MSB     0x12    /* NTC voltage result MSB  */
+#define NPM1300_ADC_TEMP_MSB    0x13    /* die temperature MSB     */
 #define NPM1300_ADC_VSYS_MSB    0x14    /* VSYS result MSB         */
 
 /* ---- Charger page (0x03) offsets (per nPM1300 PS / Zephyr driver) ---- */
@@ -49,6 +54,7 @@ static const char *TAG = "npm1300_led";
 #define NPM1300_BCHG_EN_SET     0x04    /* write 1 = enable charger */
 #define NPM1300_BCHG_EN_CLR     0x05    /* write 1 = disable charger */
 #define NPM1300_BCHG_DIS_SET    0x06    /* bit1 = disable NTC monitoring */
+#define NPM1300_BCHG_DIS_CLR    0x07    /* bit1 = re-enable NTC monitoring */
 #define NPM1300_BCHG_ISETMSB    0x08    /* ICHG MSB: (mA/2) >> 1   */
 #define NPM1300_BCHG_ISETLSB    0x09    /* ICHG LSB: (mA/2) &  1   */
 #define NPM1300_BCHG_VTERM      0x0C    /* (V-3.50)/0.05 V steps   */
@@ -242,40 +248,55 @@ esp_err_t npm1300_enable_charger(void)
     ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_EN_CLR, 0x01);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG disable failed: %s", esp_err_to_name(ret)); return ret; }
 
-    /* 2. NTC config — this battery pack includes a 10 kΩ / β=3380 NTC.
-     *    NTC monitoring stays ENABLED (do NOT set BCHGDISABLESET bit 1).
-     *    NTCR_SEL = 1 selects the 10 kΩ pull-up that matches the thermistor.
-     *    TASK_AUTO = 1 starts the auto ADC sequence so VBAT / temp / VBUS are
-     *    continuously sampled — without this the charger state machine never
-     *    sees a fresh temperature reading and stays in idle.
+    /* 2. NTC config — battery pack (YJ503030) uses a 100 kΩ / β=4250 NTC.
+     *    Explicitly re-enable NTC monitoring (BCHGDISABLECLR bit 1) in case
+     *    an older firmware build left BCHGDISABLESET bit 1 latched. Then
+     *    select the 100 kΩ pull-up and start the ADC auto-sample task so
+     *    the charger sees a fresh VBAT/NTC reading.
      *    NTCR_SEL encoding: 0=off, 1=10k, 2=47k, 3=100k. */
-    ret = npm1300_write(NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, 0x01);
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_DIS_CLR, 0x02);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG NTC re-enable failed: %s", esp_err_to_name(ret)); return ret; }
+    ret = npm1300_write(NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, 0x03);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "ADC NTCR_SEL failed: %s", esp_err_to_name(ret)); return ret; }
     ret = npm1300_write(NPM1300_ADC_PAGE,  NPM1300_ADC_TASK_AUTO, 0x01);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "ADC TASK_AUTO failed: %s", esp_err_to_name(ret)); return ret; }
 
-    /* 3. Charging current = 150 mA. Encoding: isteps = mA/2 (each step = 2 mA),
-     *    MSB = isteps >> 1, LSB = isteps & 1. 150/2 = 75 → MSB=37, LSB=1. */
-    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, 37);
+    /* 3. Charging current = 200 mA (0.5C, the standard charging current spec'd
+     *    by the YJ503030 battery datasheet). Encoding per nPM1300 reg map:
+     *      ICHG (mA) = MSB * 4 + LSB * 2
+     *      200 = 50 * 4 + 0 * 2  → MSB = 50 (0x32), LSB = 0 */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, 50);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ISETMSB failed: %s", esp_err_to_name(ret)); return ret; }
-    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, 1);
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, 0);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ISETLSB failed: %s", esp_err_to_name(ret)); return ret; }
 
-    /* 4. Termination voltage. Encoding: val = (V - 3.50) / 0.05.
-     *      4.15 V → 13 (normal)
+    /* 4. Termination voltage = 4.20 V (= FC per battery datasheet, well below
+     *    PCM over-charge threshold 4.28 V). Encoding: val = (V - 3.50) / 0.05.
+     *      4.20 V → 14 (normal)
      *      4.00 V → 10 (warm JEITA) */
-    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,  13);
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,  14);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG VTERM failed: %s", esp_err_to_name(ret)); return ret; }
     ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERMR, 10);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG VTERMR failed: %s", esp_err_to_name(ret)); return ret; }
 
-    /* 5. Clear any latched charger errors before re-enabling. */
+    /* 5. Let the state machine see the new config before we clear errors —
+     *    some BCHG settings (VTERM, ICHG) are only sampled when leaving the
+     *    disabled state.  100 ms is well over the spec'd internal settling. */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* 6. Clear any latched charger errors before re-enabling. */
     ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ERR_CLR, 0x01);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ERR_CLR failed: %s", esp_err_to_name(ret)); return ret; }
 
-    /* 6. Enable charger. */
+    /* 7. Enable charger.  Task register: write 1 fires the task to enable. */
     ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_EN_SET, 0x01);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG EN_SET failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 8. Allow the charger to settle, then re-pulse EN_SET — this matches the
+     *    "disable → configure → enable" recipe in the knowledge base note and
+     *    ensures the state machine actually picks up the new ICHG/VTERM. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    (void)npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_EN_SET, 0x01);
 
     /* 7. Read back every register we just programmed so we can spot any
      *    silent I2C-write loss or wrong-address bug from the log. */
