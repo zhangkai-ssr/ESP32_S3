@@ -23,6 +23,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "npm1300_led";
 
@@ -30,6 +32,38 @@ static const char *TAG = "npm1300_led";
 #define NPM1300_LED_PAGE        0x66    /* LED page (verified empirically) */
 #define NPM1300_BUCK_PAGE       0x04    /* BUCK regulators */
 #define NPM1300_LDSW_PAGE       0x08    /* LDSW / LDO regulators */
+#define NPM1300_CHGR_PAGE       0x03    /* battery charger (BCHG) */
+#define NPM1300_VBUS_PAGE       0x02    /* VBUS input limiter */
+#define NPM1300_ADC_PAGE        0x05    /* ADC + NTC config        */
+
+/* ---- ADC page (0x05) offsets ---- */
+#define NPM1300_ADC_TASK_VBAT   0x00    /* 1 = start VBAT measure  */
+#define NPM1300_ADC_NTCR_SEL    0x0A    /* 0 = NTC pull-up disabled */
+#define NPM1300_ADC_TASK_AUTO   0x0C    /* 1 = start auto-temp     */
+#define NPM1300_ADC_VBAT_MSB    0x11    /* VBAT result high byte   */
+#define NPM1300_ADC_NTC_MSB     0x13    /* NTC voltage result MSB  */
+#define NPM1300_ADC_VSYS_MSB    0x14    /* VSYS result MSB         */
+
+/* ---- Charger page (0x03) offsets (per nPM1300 PS / Zephyr driver) ---- */
+#define NPM1300_BCHG_ERR_CLR    0x00    /* write 1 = clear charger errors */
+#define NPM1300_BCHG_EN_SET     0x04    /* write 1 = enable charger */
+#define NPM1300_BCHG_EN_CLR     0x05    /* write 1 = disable charger */
+#define NPM1300_BCHG_DIS_SET    0x06    /* bit1 = disable NTC monitoring */
+#define NPM1300_BCHG_ISETMSB    0x08    /* ICHG MSB: (mA/2) >> 1   */
+#define NPM1300_BCHG_ISETLSB    0x09    /* ICHG LSB: (mA/2) &  1   */
+#define NPM1300_BCHG_VTERM      0x0C    /* (V-3.50)/0.05 V steps   */
+#define NPM1300_BCHG_VTERMR     0x0D    /* warm-temp term voltage  */
+#define NPM1300_BCHG_STATUS     0x34    /* BCHGCHARGESTATUS        */
+#define NPM1300_BCHG_ERR_REASON 0x36    /* BCHGERRREASON           */
+#define NPM1300_BCHG_ERR_SENSOR 0x37    /* BCHGERRSENSOR           */
+
+/* ---- VBUS page (0x02) offsets ---- */
+#define NPM1300_VBUS_STATUS     0x07    /* bit0 = VBUS present     */
+#define NPM1300_VBUS_TASKUPDILIM 0x00   /* write 1 = apply new ILIM */
+#define NPM1300_VBUS_INILIM0    0x01    /* VBUS input current limit:
+                                         *  0 = 100 mA (SDP unconfigured)
+                                         *  1 = 500 mA (SDP configured)
+                                         *  2..7 = higher (DCP / CDP) */
 
 /* ---- BUCK page (0x04) offsets ---- */
 #define NPM1300_BUCK1_ENASET    0x00    /* write 1 to enable BUCK1 */
@@ -173,6 +207,207 @@ static esp_err_t npm1300_write_verify(const char *tag, uint8_t page,
     }
     ESP_LOGE(TAG, "%s give up after 3 tries", tag);
     return ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t npm1300_enable_charger(void)
+{
+    esp_err_t ret;
+    uint8_t   vbus_status = 0;
+
+    ESP_LOGI(TAG, "configuring NPM1300 charger (150 mA, 4.15 V, NTC off)");
+
+    /* Read VBUS status — informational only, charger setup still proceeds
+     * because VBUS may come up after this function (e.g. battery-only boot). */
+    uint8_t cmd[2] = { NPM1300_VBUS_PAGE, NPM1300_VBUS_STATUS };
+    if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                     cmd, 2, &vbus_status, 1,
+                                     pdMS_TO_TICKS(10)) == ESP_OK) {
+        ESP_LOGI(TAG, "VBUS_STATUS = 0x%02X (VBUS %s)",
+                 vbus_status, (vbus_status & 0x01) ? "PRESENT" : "ABSENT");
+    }
+
+    /* 0. Force VBUS input current limit to 500 mA. The nPM1300 hardware-
+     *    default ILIM after VBUS insertion is 100 mA (SDP unconfigured) —
+     *    the bump to 500 mA normally happens after USB host enumeration
+     *    sets the SDP-configured state. When the board is powered by a
+     *    plain USB charger (no enumeration) it stays at 100 mA, and the
+     *    charger state machine refuses to leave idle because 100 mA cannot
+     *    cover both VSYS draw and the 150 mA charge current we asked for. */
+    ret = npm1300_write(NPM1300_VBUS_PAGE, NPM1300_VBUS_INILIM0, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "VBUS ILIM set failed: %s", esp_err_to_name(ret)); return ret; }
+    ret = npm1300_write(NPM1300_VBUS_PAGE, NPM1300_VBUS_TASKUPDILIM, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "VBUS ILIM apply failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 1. Disable charger so we configure into a clean state machine. */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_EN_CLR, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG disable failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 2. NTC config — this battery pack includes a 10 kΩ / β=3380 NTC.
+     *    NTC monitoring stays ENABLED (do NOT set BCHGDISABLESET bit 1).
+     *    NTCR_SEL = 1 selects the 10 kΩ pull-up that matches the thermistor.
+     *    TASK_AUTO = 1 starts the auto ADC sequence so VBAT / temp / VBUS are
+     *    continuously sampled — without this the charger state machine never
+     *    sees a fresh temperature reading and stays in idle.
+     *    NTCR_SEL encoding: 0=off, 1=10k, 2=47k, 3=100k. */
+    ret = npm1300_write(NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "ADC NTCR_SEL failed: %s", esp_err_to_name(ret)); return ret; }
+    ret = npm1300_write(NPM1300_ADC_PAGE,  NPM1300_ADC_TASK_AUTO, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "ADC TASK_AUTO failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 3. Charging current = 150 mA. Encoding: isteps = mA/2 (each step = 2 mA),
+     *    MSB = isteps >> 1, LSB = isteps & 1. 150/2 = 75 → MSB=37, LSB=1. */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, 37);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ISETMSB failed: %s", esp_err_to_name(ret)); return ret; }
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, 1);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ISETLSB failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 4. Termination voltage. Encoding: val = (V - 3.50) / 0.05.
+     *      4.15 V → 13 (normal)
+     *      4.00 V → 10 (warm JEITA) */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,  13);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG VTERM failed: %s", esp_err_to_name(ret)); return ret; }
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERMR, 10);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG VTERMR failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 5. Clear any latched charger errors before re-enabling. */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_ERR_CLR, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG ERR_CLR failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 6. Enable charger. */
+    ret = npm1300_write(NPM1300_CHGR_PAGE, NPM1300_BCHG_EN_SET, 0x01);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "BCHG EN_SET failed: %s", esp_err_to_name(ret)); return ret; }
+
+    /* 7. Read back every register we just programmed so we can spot any
+     *    silent I2C-write loss or wrong-address bug from the log. */
+    static const struct { uint8_t page, off; const char *name; } regs[] = {
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, "ISETMSB" },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, "ISETLSB" },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,   "VTERM"   },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERMR,  "VTERMR"  },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_DIS_SET, "DIS_SET" },
+        { NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, "NTCR_SEL"},
+    };
+    for (int i = 0; i < (int)(sizeof(regs)/sizeof(regs[0])); i++) {
+        uint8_t v = 0xFF;
+        cmd[0] = regs[i].page; cmd[1] = regs[i].off;
+        if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                         cmd, 2, &v, 1,
+                                         pdMS_TO_TICKS(10)) == ESP_OK) {
+            ESP_LOGI(TAG, "CHG_INIT: page=%02X off=%02X %-8s = 0x%02X",
+                     regs[i].page, regs[i].off, regs[i].name, v);
+        } else {
+            ESP_LOGW(TAG, "CHG_INIT: read %02X/%02X (%s) failed",
+                     regs[i].page, regs[i].off, regs[i].name);
+        }
+    }
+
+    uint8_t status = 0;
+    cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_STATUS;
+    if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                     cmd, 2, &status, 1,
+                                     pdMS_TO_TICKS(10)) == ESP_OK) {
+        /* BCHGCHARGESTATUS bits: 0=battery_detected, 1=charging_complete,
+         *   2=trickle, 3=cc, 4=cv, 5=recharge, 6=NTC_warm, 7=supplement */
+        ESP_LOGI(TAG, "BCHG_STATUS = 0x%02X (bat=%d trickle=%d CC=%d CV=%d)",
+                 status,
+                 (status >> 0) & 1, (status >> 2) & 1,
+                 (status >> 3) & 1, (status >> 4) & 1);
+    }
+    return ESP_OK;
+}
+
+void npm1300_log_charger_status(void)
+{
+    uint8_t cmd[2];
+    uint8_t vbus = 0, bchg = 0;
+
+    cmd[0] = NPM1300_VBUS_PAGE; cmd[1] = NPM1300_VBUS_STATUS;
+    if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                     cmd, 2, &vbus, 1, pdMS_TO_TICKS(10)) != ESP_OK) {
+        ESP_LOGW(TAG, "CHG: VBUS read failed");
+        return;
+    }
+    cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_STATUS;
+    if (i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                     cmd, 2, &bchg, 1, pdMS_TO_TICKS(10)) != ESP_OK) {
+        ESP_LOGW(TAG, "CHG: BCHG_STATUS read failed");
+        return;
+    }
+    /* BCHGCHARGESTATUS bits:
+     *  0 = battery_detected
+     *  1 = charging_complete
+     *  2 = trickle_charge   (low cell → ~10 % ICHG)
+     *  3 = constant_current (CC, full ICHG)
+     *  4 = constant_voltage (CV, near termination V)
+     *  5 = recharge
+     *  6 = NTC warm/JEITA
+     *  7 = supplement (battery sourcing into VSYS together with VBUS) */
+    const char *phase =
+        (bchg & 0x02) ? "complete"   :
+        (bchg & 0x10) ? "CV"         :
+        (bchg & 0x08) ? "CC"         :
+        (bchg & 0x04) ? "trickle"    :
+        (bchg & 0x20) ? "recharge"   :
+        (bchg & 0x80) ? "supplement" :
+                        "idle";
+    uint8_t err_reason = 0, err_sensor = 0;
+    cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_ERR_REASON;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &err_reason, 1, pdMS_TO_TICKS(10));
+    cmd[0] = NPM1300_CHGR_PAGE; cmd[1] = NPM1300_BCHG_ERR_SENSOR;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &err_sensor, 1, pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG,
+             "CHG: VBUS=%s BCHG=0x%02X [%s] bat_det=%d err_r=0x%02X err_s=0x%02X",
+             (vbus & 0x01) ? "ON" : "OFF",
+             bchg, phase, (bchg >> 0) & 1, err_reason, err_sensor);
+
+    /* Dump every register we configured at init so we can see, from the
+     * runtime log alone, whether each write actually stuck. The boot-time
+     * dump is often lost to the host serial monitor sync delay. */
+    static const struct { uint8_t page, off; const char *name; } regs[] = {
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETMSB, "ISETMSB" },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_ISETLSB, "ISETLSB" },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_VTERM,   "VTERM"   },
+        { NPM1300_CHGR_PAGE, NPM1300_BCHG_DIS_SET, "DIS_SET" },
+        { NPM1300_ADC_PAGE,  NPM1300_ADC_NTCR_SEL, "NTCR_SEL"},
+    };
+    char line[160] = "CHG_REGS:";
+    size_t off = strlen(line);
+    for (int i = 0; i < (int)(sizeof(regs)/sizeof(regs[0])); i++) {
+        uint8_t v = 0xFF;
+        cmd[0] = regs[i].page; cmd[1] = regs[i].off;
+        (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                           cmd, 2, &v, 1, pdMS_TO_TICKS(10));
+        off += snprintf(line + off, sizeof(line) - off,
+                        " %s=0x%02X", regs[i].name, v);
+    }
+    ESP_LOGI(TAG, "%s", line);
+
+    /* Read the most recent auto-measurement results.  We do NOT trigger a
+     * fresh single-shot conversion here: the auto sequence (started in
+     * enable_charger via TASK_AUTO) keeps fresh results in 0x11/0x13/0x14,
+     * and writing TASK_VBAT from the main task was tripping the interrupt
+     * watchdog on CPU0 (likely via an nPM1300 INT pulse that nobody handles).
+     */
+    uint8_t vbat_msb = 0, vsys_msb = 0, ntc_msb = 0;
+    cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_VBAT_MSB;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &vbat_msb, 1, pdMS_TO_TICKS(10));
+    cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_VSYS_MSB;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &vsys_msb, 1, pdMS_TO_TICKS(10));
+    cmd[0] = NPM1300_ADC_PAGE; cmd[1] = NPM1300_ADC_NTC_MSB;
+    (void)i2c_master_write_read_device(NPM1300_I2C_PORT, NPM1300_I2C_ADDR,
+                                       cmd, 2, &ntc_msb, 1, pdMS_TO_TICKS(10));
+
+    /* MSBs are top 8 bits of a 10-bit value (LSBs in 0x18 — ignored for
+     * coarse view).  Convert as: V = vfull * msb / 255 (close enough). */
+    unsigned vbat_mv = (5000u  * vbat_msb) / 255u;
+    unsigned vsys_mv = (6375u  * vsys_msb) / 255u;
+    unsigned ntc_mv  = (1000u  * ntc_msb)  / 255u;
+    ESP_LOGI(TAG, "CHG_ADC: VBAT=%u mV  VSYS=%u mV  NTC=%u mV  (raw 0x%02X/0x%02X/0x%02X)",
+             vbat_mv, vsys_mv, ntc_mv, vbat_msb, vsys_msb, ntc_msb);
 }
 
 esp_err_t npm1300_enable_sensor_rails(void)

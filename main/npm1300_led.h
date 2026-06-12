@@ -57,6 +57,36 @@ esp_err_t npm1300_led_init(void);
 esp_err_t npm1300_enable_sensor_rails(void);
 
 /**
+ * @brief  Enable the NPM1300 battery charger.
+ *
+ * NPM1300 power-on default leaves the charger DISABLED, and charging current
+ * (BCHGISET) reset value is 0 — so charger must be explicitly configured even
+ * before being enabled. Without this call, plugging USB will NOT charge the
+ * battery, and with a depleted cell the system will brown-out as soon as WiFi
+ * PA starts (VBUS ILIM alone cannot supply the peak current).
+ *
+ * Configuration (matches the nrf54l15_blinky4 reference project):
+ *   - Charging current      : 150 mA   (BCHGISETMSB/LSB)
+ *   - Termination voltage   : 4.15 V   (BCHGVTERM)
+ *   - Warm-temp termination : 4.00 V   (BCHGVTERMR)
+ *   - NTC monitoring        : disabled (NTC pin tied to ground on this board)
+ *
+ * Call this very early in app_main() — BEFORE npm1300_enable_sensor_rails()
+ * and BEFORE wifi/PHY init — so the battery starts charging immediately and
+ * has the best chance of supplementing VSYS by the time WiFi PA fires up.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t npm1300_enable_charger(void);
+
+/**
+ * @brief  Read and log charger status (VBUS presence + BCHG state machine).
+ *         Safe to call from the main heartbeat loop; takes a few I2C reads
+ *         on the PMIC bus.
+ */
+void npm1300_log_charger_status(void);
+
+/**
  * @brief  Directly set the on/off state of each RGB channel.
  *         This is the only hardware write path; call it only from the
  *         led_ctrl layer to keep I2C traffic minimal.
