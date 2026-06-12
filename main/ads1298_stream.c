@@ -23,7 +23,7 @@
 #define HOST_IP             "10.42.0.1"
 #define HOST_PORT           3333
 #define RECONNECT_DELAY_MS  1000
-#define BATCH_FRAMES        25
+#define BATCH_FRAMES        100
 #define BATCH_BYTES         (PACKET_SIZE * BATCH_FRAMES)
 #define DRDY_TIMEOUT_MS     50
 
